@@ -30,6 +30,13 @@ class FollowConfig:
     yaw_limit: float = 0.20
     forward_limit: float = 0.30
     max_request_rate: float | None = 0.8
+    vertical_follow: bool = False
+    distance_mode: str = "apparent_pixels"
+    camera_calibration: str | None = None
+    camera_id: str | None = None
+    marker_side_m: float | None = None
+    vertical_min_height_cm: float = 50.0
+    vertical_max_height_cm: float = 200.0
 
     def __post_init__(self):
         if (not isinstance(self.instance_id, str) or not self.instance_id.strip()
@@ -56,6 +63,29 @@ class FollowConfig:
                 type(self.max_request_rate) not in (int, float)
                 or not math.isfinite(self.max_request_rate) or self.max_request_rate <= 0):
             raise ValueError("max_request_rate must be a finite positive number or null")
+        if type(self.vertical_follow) is not bool:
+            raise ValueError("vertical_follow must be a boolean")
+        if self.vertical_follow and self.control_profile != "openpose_pid":
+            raise ValueError("vertical_follow requires openpose_pid")
+        if self.distance_mode not in ("apparent_pixels", "relative_size", "pose"):
+            raise ValueError("distance_mode must be apparent_pixels, relative_size or pose")
+        if self.distance_mode != "apparent_pixels" and self.control_profile != "openpose_pid":
+            raise ValueError("relative/pose distance requires openpose_pid")
+        if self.distance_mode == "pose":
+            if (not isinstance(self.camera_calibration, str) or not self.camera_calibration.strip()
+                    or not Path(self.camera_calibration).is_absolute()
+                    or not isinstance(self.camera_id, str) or not self.camera_id.strip()
+                    or type(self.marker_side_m) not in (int, float)
+                    or not math.isfinite(self.marker_side_m) or not .02 <= self.marker_side_m <= 1):
+                raise ValueError("pose requires absolute camera_calibration, camera_id and measured marker_side_m")
+        elif any(v is not None for v in (self.camera_calibration, self.camera_id, self.marker_side_m)):
+            raise ValueError("camera calibration fields require pose distance_mode")
+        for name in ("vertical_min_height_cm", "vertical_max_height_cm"):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 250:
+                raise ValueError(name + " must be in [0, 250] cm")
+        if self.vertical_max_height_cm-self.vertical_min_height_cm < 40:
+            raise ValueError("vertical height interval must span at least 40 cm")
         if self.physical_distance_m is not None and (
                 type(self.physical_distance_m) not in (int, float)
                 or not math.isfinite(self.physical_distance_m)
@@ -69,7 +99,9 @@ class FollowConfig:
 def _from_mapping(value):
     required = {"instance_id", "target_id", "dictionary", "control_profile"}
     allowed = required | {"physical_distance_m", "steering_mode",
-                          "yaw_limit", "forward_limit", "max_request_rate"}
+                          "yaw_limit", "forward_limit", "max_request_rate", "vertical_follow",
+                          "distance_mode", "camera_calibration", "camera_id", "marker_side_m",
+                          "vertical_min_height_cm", "vertical_max_height_cm"}
     keys = set(value)
     missing, unknown = required - keys, keys - allowed
     if missing:

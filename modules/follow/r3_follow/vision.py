@@ -534,7 +534,7 @@ class MarkerTracker:
                 and np.linalg.norm(a.mean(0)-b.mean(0)) < .15*np.sqrt(min(area_a, area_b)))
 
 
-def synthetic_frame(x=0.5, size=0.25, visible=True, marker_id=0):
+def synthetic_frame(x=0.5, size=0.25, visible=True, marker_id=0, *, y=0.5):
     """Synthetic camera input only; does not simulate aircraft physics."""
     frame = np.full((480, 640, 3), 245, dtype=np.uint8)
     if visible:
@@ -542,6 +542,6 @@ def synthetic_frame(x=0.5, size=0.25, visible=True, marker_id=0):
         dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         marker = cv2.aruco.generateImageMarker(dictionary, marker_id, side)
         left = max(20, min(620 - side, int(x * 640 - side / 2)))
-        top = 240 - side // 2
+        top = max(20, min(460 - side, int(y * 480) - side // 2))
         frame[top:top+side, left:left+side] = cv2.cvtColor(marker, cv2.COLOR_GRAY2BGR)
     return frame

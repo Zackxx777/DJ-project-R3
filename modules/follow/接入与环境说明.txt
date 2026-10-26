@@ -1,50 +1,79 @@
-三组接入与环境说明 — closeout1
+复查命令（Python 3.11，不连接任何设备）
 
-范围
-只交接modules/follow。二组保留自己的底层与统一入口，四组保留自己的模块。
-本包按本地已有9889b47接口验证；对方若已有后续提交，先核对接口和绑定，不整包覆盖他的仓库。
-不要把本包的配置、哈希白名单或测试结果自动当成对后续任意提交的认可。
+包根目录：python -X utf8 -B verify_delivery.py
+配置检查：python -X utf8 -B modules/follow/check_follow_config.py --config modules/follow/configs/aircraft_A_ID0.json
+单独制动测试：进入modules/follow后，python -X utf8 -B -m unittest discover -s tests -p test_depth_braking.py -v
+连续模拟：python -X utf8 -B modules/follow/braking_flight_check.py --matrix --output 新结果目录
+同输入旧版对照：同一命令增加 --source 旧版modules/follow绝对目录
+仅减速发送的分项对照：增加 --without-lead（仅用于离线模拟，不是实飞开关）。
+另一个标记：增加 --config modules/follow/configs/aircraft_B_ID1.json 或 C。
+完整回归：在同基准完整仓库中运行 python -X utf8 -B modules/follow/verify_r3_changes.py --output 新回归目录。
+完整回归的已有SDK/AI用例需要原仓库模块，三组单独包不包含二四组源码，不能据缺少它们判定三组包损坏。
+本轮基准仍为4f586860bc7dbcf46dd8be97aa259fc7027d02a8及上次时序验证版，未抓取远端更新。
+所有默认日志不含图像和音频。包内SYNTHETIC文件仅为模拟内参，不可放进真实飞行配置。
 
-必须显式选配置
-三组team2_bridge.Team3FollowBridge创建时读取R3_FOLLOW_CONFIG。
-环境变量不存在时沿用legacy默认；摄像头测试入口的openpose设置不会传给统一SDK。
-在二组原有启动命令之前，在同一个PowerShell窗口、仓库根目录运行：
-$env:R3_FOLLOW_CONFIG = (Resolve-Path -LiteralPath '.\modules\follow\configs\aircraft_A_ID0.json').Path
-然后使用二组原来的Python3.11启动命令。此处没有新增或替换二组启动入口。
-第二架用aircraft_B_ID1.json；第三架用aircraft_C_ID2.json。
-启动后核对get_follow_status()中的configured_control_profile=openpose_pid、
-control_profile=openpose_pid_marker_v2、configured_steering_mode=yaw，以及各自target_id和instance_id。
+下午测试步骤 — 三组制动测试版（r3-4f58686-braking1）
 
-旧诊断入口注意
-本地仓库run_final_real_sim.py第91行直接FollowController(target_id=marker_id)，绕过桥接配置，
-仍使用legacy/lateral；第116和126行将yaw写死为0。设置R3_FOLLOW_CONFIG也不会改变这段直接计算。
-正式三组验证请走二组controller.start_follow()服务入口。
-如果现场仍要用这个诊断脚本，请二组自行适配其配置读取和完整四通道展示/转发；我们未改它。
-这里的行号对应本包所用9889b47副本，二组后续版本需按函数内容定位。
+这次要看三件事：能否跟上；人停下后是否靠近过头；换方向时是否来回冲退。不要只看绿框。
 
-可选模式
-configs/aircraft_*.json为保守默认yaw；configs/offline_candidates下有lateral、hybrid候选。
-如要离线检查hybrid，可把上面路径换为：
-.\modules\follow\configs\offline_candidates\aircraft_A_ID0_hybrid.json
-必须停止并销毁旧服务后新建服务；仅修改文件或环境变量不会改变已运行实例。
-不要边飞边热切换。新模式只验证了程序请求，实际运动效果未验证。
+一、出发前
+1. 完整解压这个包到一个新文件夹，保留旧包。电脑使用已有Python 3.11；原3.14不动。
+2. 双击“离线自检.cmd”。看到校验通过再继续。若找不到Python3.11，使用已有3.11的python.exe：
+   在命令窗口设置 set "R3_PYTHON=已有3.11环境的python.exe完整路径"，然后从该窗口运行自检或摄像头入口。
+   不要临时切到3.14，也不用重新安装依赖。
+3. 带对应编号的现有标记：A对应0，B对应1，C对应2。先测一架和一个目标。
+   图案贴平在硬板上，黑框和白边完整；量黑色方块的实际边长（不包括白边），记下厘米数。
+4. 带卷尺，用手机拍现场视频。准备记录标记介质、距离、光线、电量、版本和日志文件名；不必另写正式报告。
 
-多机边界
-ID0、1、2对应不同完整ArUco图案，字典均为DICT_4X4_50。
-每个进程的配置只指定跟随哪个图案；实际飞机连接必须各自正确绑定。
-不把同一图案贴在不同的人身上。多编号同框测试不等于三机网络或实飞已经验证。
+二、可选：出发前做电脑摄像头检查（仅模拟请求）
+1. 关掉之前的测试窗口，避免两个程序抢摄像头。
+2. 按标记编号双击摄像头测试_A_ID0.cmd、B_ID1或C_ID2。顶部应显示r3-4f58686-braking1。
+3. 标记正对摄像头，在希望保持的位置固定；有绿框后点“1 记录参考大小”，再点“2 开始”。
+4. 这次按下述动作手动测，不必点“3 分段测试”：原地5秒→缓慢拿远5秒→停住5秒→缓慢拿近5秒→停住5秒。
+   看前后RC及“前后制动”一行；靠近时出现负数表示飞机后退请求。为提前制动，到参考大小之前也可能出现短暂负数。
+5. 点“停止”，再关闭窗口。日志自动保存到 modules/follow/logs；保留本轮.jsonl和.bench.json。
+   这轮只能确认识别到请求的过程，不能确认飞机是否真能刹住。
 
-接口保持
-start_follow/stop_follow/is_following、get_follow_status、pause_for_action/finish_action保持原调用方式。
-四组仍走二组统一入口，不另接第二套飞机控制通道。
-physical_distance_m只是已有配置中的人工备注，不能单凭该字段让统一SDK报告精确米数。
-本次有条件的估距接在三组本机测试窗口中；统一界面后续如需显示，可读三组工具结果，不能伪造单位。
+三、现场先确认用的是哪份代码
+1. 二组继续使用他们的统一程序，只合并本包三组差异，不覆盖SDK或四组AI。保留现场已能运行的版本。
+2. 启动前选择对应的R3_FOLLOW_CONFIG，停止旧进程后重启。配置检查可用：
+   python -X utf8 -B modules/follow/check_follow_config.py --config modules/follow/configs/aircraft_A_ID0.json
+   输出source_version=r3-4f58686-braking1、depth_brake_enabled=true、actual_depth_brake.profile=bounded_depth_lead_v1。
+3. 正式运行后还要看该进程生成的日志：session_start.version应为r3-4f58686-braking1；motion_request里应有depth_brake。
+   仅配置检查通过不代表统一程序加载了同一路径。若仍显示旧版本，先排查加载路径，不急着飞。
+4. 三组负责拿标记、观察跟随和记时间。起飞、降落和独立接管按二组现场现有流程执行。
+   场地允许的起始间距与停止线由现场操控人员确定，记具体米数；不要把模拟中的2米当作安全承诺。
 
-环境与自检
-Python3.11；本轮复用现有环境，没有下载安装依赖。
-camera_pid_bench.py使用OpenCV、NumPy、Tkinter，只接MockPort。
-本机包根目录的cmd入口自动寻找当前项目的.venv311；其他电脑可先设置R3_PYTHON为已有3.11解释器绝对路径。
-不修改原Python3.14环境。
-不打开相机的检查：python -X utf8 -B modules/follow/camera_pid_bench.py --self-check
-完整仓库上下文中的回归：python -X utf8 -B modules/follow/verify_r3_changes.py --output <新的输出目录>
-完整回归需要二组SDK及测试引用的四组文件；本包仅含三组，因此不要脱离原仓库宣称联调已验收。
+四、第一轮：建立方向与停止基线
+1. 在现场负责人完成起飞、稳定悬停后，标记正对机载摄像头，保持高度和距离不动。
+2. 通过统一程序记录参考大小、启动跟随，记录参考间距。不要用电脑摄像头窗口代替真实跟随入口。
+3. 小幅、缓慢远离，然后停住；预期出现前进请求，再随着接近而减小。实际机体表现也要拍到。
+4. 缓慢靠近，再停住；预期能出现后退请求。方向以飞机看出去为准。
+5. 通过现有入口停止跟随，确认请求归零，再观察机体还移动多久、多远。
+   如方向相反、停止入口无效、持续逼近停止线或明显反复冲退，这轮立即交给现场操控人员接管，记录时间点后结束。
+
+五、第二轮：主要对照，重复3次
+每轮重新在同一条参考线校准，标记保持正对，尽量保持相同电量和光线条件。
+1. 原地站定5秒。开始录像，说“本轮开始，版本制动测试版”。
+2. 沿空旷直线缓慢远离约5秒，到地面事先标好的点。
+3. 停住约5秒，清楚说“现在停住”。记录飞机最近到了哪里、前进请求何时减小、机体何时真正停住。
+4. 在现场操控人员确认间距允许后，缓慢回到起始参考线，随后再停5秒。不要突然向飞机冲过去。
+5. 停止跟随，记录本轮日志名。重复三次，动作距离尽量相同。
+如需要与旧版现场比较，只在现场人员确认旧版可以继续测试的条件下，沿用相同线路和记录方式；没有旧版新实测就标明缺少现场对照。
+
+六、主测试通过后，再做短补测
+1. 小幅左右移动：应仍能转向对准；默认yaw模式本来就不横移，不能把横移0当故障。
+2. 先站定，再遮挡标记约1秒后恢复：遮挡时请求应归零，恢复需重新确认目标；不应沿旧趋势继续冲。
+3. 侧转再转正：看前后暂停原因是否清楚；恢复后是否突然跳出旧的制动请求。
+4. 模型接管、人工停止和降落沿用统一入口；新跟随请求不能顶掉接管，也不能自动恢复被明确停止的任务。
+只有主测试稳定后再考虑第二、第三架；不同ID只解决目标区分，不提供飞机之间的避碰。
+
+七、交回哪些资料
+每轮的三组原始.jsonl日志（默认modules/follow/logs/background；若二组指定其他位置，以运行状态中的log路径为准）；
+二组同一时段的设备日志；现场视频；对应config JSON；填写“现场记录表.csv”。
+记录“现在停住/现在往回走”等动作时刻，并让视频包含电脑时钟或口头报时，方便与日志对齐。
+区分请求归零时间和实际机体停住时间。RC不能当厘米/秒；本轮根据实际位移和时间记录速度。
+同一日志里有多轮测试时，记轮次和时间段即可，不必每轮重启。
+日志默认不含照片/录像，现场视频需要另外拍。全部测试结束后先停止跟随，再正常结束程序让日志写完，最后复制文件；不要强制结束进程。
+
+本包没有替二组验证最新实机入口，没有打开摄像头或飞行；离线通过不等于已完成实飞验收。

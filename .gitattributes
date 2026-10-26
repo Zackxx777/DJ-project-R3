@@ -1,0 +1,2 @@
+# Preserve original vendored bytes used by SHA-256 provenance checks.
+modules/follow/r3_follow/_vendor/** -text

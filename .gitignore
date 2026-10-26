@@ -255,3 +255,16 @@ temp_follow_pid/
 # --- 四组音频新架构的交付包/覆盖前备份（临时材料，不入库）---
 temp_ai_new/
 temp_ai_prev_*/
+
+# Local secrets, environments and recordings
+.env.*
+!.env.example
+.venv*/
+recordings/
+*.wav
+*.mp3
+*.mp4
+*.pem
+*.key
+*.pfx
+*.p12

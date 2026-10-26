@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/LenLanxi/DJ-project",
+  "tag": "v4.1-bluetooth-ai-integrated",
+  "commit": "9a7d2a17c4634b0c26bcab82a48410021031e714",
+  "snapshot_commit": "727f2af",
+  "r3_source_base": "4f586860bc7dbcf46dd8be97aa259fc7027d02a8",
+  "r3_version": "r3-9a7d2a1-braking1",
+  "preserved_modules": [
+    "drone_sdk",
+    "modules/ai"
+  ],
+  "preserved_file_count": 66,
+  "import_method": "independent repository, tracked source snapshot, original project history retained at upstream URL",
+  "snapshot_date": "2026-10-26"
+}
