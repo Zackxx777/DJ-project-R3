@@ -30,6 +30,7 @@ class StatusResult:
     command_epoch: int = 0
     velocity: tuple = (0, 0, 0, 0)
     simulated: bool = True
+    height_timestamp: Optional[float] = None  # state packet receipt, not query time
 
 @dataclass
 class FrameResult:

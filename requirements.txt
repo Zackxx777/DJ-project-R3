@@ -6,6 +6,8 @@ numpy==1.26.4
 # ===== Group 4: AI module (modules/ai) =====
 # Voice recording/playback; only needed for /voice input and spoken replies.
 sounddevice>=0.5,<0.6
+# Streaming resampling for headset devices at 44.1/48 kHz.
+soxr>=0.5,<2
 # Realtime duplex voice entry (docs/v4-reference): WebSocket client for the
 # Realtime API. Without it `--voice` fails at import time.
 websockets>=15,<17

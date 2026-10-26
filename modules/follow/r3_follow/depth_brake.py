@@ -1,12 +1,14 @@
 """Bounded depth-trend lead around the reused PID, not a plant-speed model.
 
-The PID gains/vendor stay unchanged. Reliable recent relative-depth change
+The vendor stays unchanged. Reliable recent relative-depth change
 adds a bounded derivative/measurement-age correction, allowing earlier braking
 and retreat without reducing the chase cap. It may reverse a request before
 the measured reference is crossed; the outer controller must send zero first.
 No continuation through lost/stale/shape-invalid targets is allowed. Rates are
 reference-distances/second, NOT metres/second. This is an R3 adaptation, not an
 upstream algorithm or a measured physical stopping-distance guarantee.
+The opt-in responsive tuning supplies its matching P scale and a longer
+approach-only allowance; the original defaults remain unchanged.
 """
 from collections import deque
 import math
@@ -24,11 +26,19 @@ class DepthBrake:
     # Same proportional slope as marker_v2 relative depth: .5 * 128 / 100.
     PROPORTIONAL_SCALE = .64
 
-    def __init__(self, forward_limit=.3):
+    def __init__(self, forward_limit=.3, *, proportional_scale=.64, braking_allowance=.25):
         if (type(forward_limit) not in (int,float) or not math.isfinite(forward_limit)
                 or not 0 < forward_limit <= 1):
             raise ValueError('forward_limit must be finite in (0,1]')
         self.forward_limit = forward_limit
+        if (type(proportional_scale) not in (int, float)
+                or not math.isfinite(proportional_scale) or not 0 < proportional_scale <= 2):
+            raise ValueError('proportional_scale must be finite in (0,2]')
+        self.proportional_scale = proportional_scale
+        if (type(braking_allowance) not in (int, float)
+                or not math.isfinite(braking_allowance) or not .25 <= braking_allowance <= .75):
+            raise ValueError('braking_allowance must be finite in [.25,.75]')
+        self.braking_allowance = braking_allowance
         self.correction_limit = min(.20, forward_limit*.5)
         self.reversal_threshold = min(.03,forward_limit*.25)
         self.reset('initial')
@@ -80,13 +90,17 @@ class DepthBrake:
         self.predicted_error = None
         self.correction = 0.
         self.age = max(0., now-captured_at)
-        self.horizon = min(self.MAX_HORIZON, self.RESPONSE_ALLOWANCE+self.age)
+        # Extra lead is ONLY for deceleration: do not boost a departing target
+        # further merely because the braking setting was increased.
+        allowance = (self.braking_allowance if self.rate is not None and request*self.rate < 0
+                     else self.RESPONSE_ALLOWANCE)
+        self.horizon = min(self.MAX_HORIZON, allowance+self.age)
         self.reason = 'insufficient_consistent_trend'
         if self.rate is None or abs(self.rate) < .005:
             return self._filter_reversal(request)
         self.predicted_error = error + self.rate*self.horizon
         self.correction = max(-self.correction_limit,min(self.correction_limit,
-            self.PROPORTIONAL_SCALE*self.rate*self.horizon))
+            self.proportional_scale*self.rate*self.horizon))
         self.output = max(-self.forward_limit,min(self.forward_limit,request+self.correction))
         self.reason = ('approach_braking' if request*self.correction < 0
                        else 'depth_trend_response')
@@ -126,11 +140,13 @@ class DepthBrake:
 
     def status(self):
         return dict(profile=self.PROFILE,reason=self.reason,samples=len(self.samples),
+                    proportional_scale=self.proportional_scale,
                     relative_rate_per_s=self.rate,observation_age_s=self.age,
                     horizon_s=self.horizon,predicted_relative_error=self.predicted_error,
                     raw_forward_request=self.raw_request,limited_forward_request=self.output,
                     correction=self.correction,correction_limit=self.correction_limit,
                     reversal_threshold_rc=self.reversal_threshold*100,
                     response_allowance_s=self.RESPONSE_ALLOWANCE,
+                    braking_allowance_s=self.braking_allowance,
                     rate_filter_tau_s=self.RATE_FILTER_TAU,
                     physical_tuning_verified=False)

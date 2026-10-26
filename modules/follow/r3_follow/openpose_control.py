@@ -41,6 +41,11 @@ Horizontal routing is an explicit R3 adaptation, not an upstream flight result.
 The same horizontal PID value feeds yaw (default), lateral, or an equal RC
 number split for hybrid. RC translation and RC rotation are different physical
 quantities: this numerical budget does not claim equal thrust, speed or effect.
+The opt-in adaptive mode sends 80% of that budget to lateral near image center,
+smoothly transferring it to yaw at offsets of 15%..55% of image half-width.
+responsive_v1 raises depth P from .5 to .75; the filter, I, D and caps stay the
+same. FollowController couples this to stronger, earlier approach braking.
+Both additions require flight validation and do not provide obstacle avoidance.
 
 Horizontal gains: upstream P=.25 with no damping saturated the +/-50 RC budget
 as soon as the marker was ~120 px off-centre on a 960-wide frame, which made
@@ -62,6 +67,9 @@ THROTTLE_GAINS = (0.4, 0.0, 0.0)
 VERTICAL_PROFILE = "openpose_throttle_marker_v1"
 UPSTREAM_PITCH_GAINS = (0.5, 0.04, 0.3)
 PITCH_GAINS = (0.5, 0.01, 0.06)
+# Opt-in field candidate: increase proportional response without increasing
+# caps, integral accumulation, or motion through missing observations.
+RESPONSIVE_PITCH_GAINS = (0.75, 0.01, 0.06)
 DEPTH_FILTER_TAU = .08
 DEPTH_REFERENCE_DEADBAND_PX = 1.0
 RELATIVE_DEPTH_EQUIVALENT_SPAN = 128.0  # 100% relative depth error -> 128 input units
@@ -81,10 +89,10 @@ class OpenPoseMarkerControl:
                 raise ValueError(f"{name} must be finite and in (0, 1]")
         if type(max_dt) not in (int, float) or not math.isfinite(max_dt) or max_dt <= 0:
             raise ValueError("max_dt must be finite and positive")
-        if tuning not in ("marker_v2", "upstream_reference"):
+        if tuning not in ("marker_v2", "responsive_v1", "upstream_reference"):
             raise ValueError("unsupported PID parameter set")
-        if steering_mode not in ("yaw", "lateral", "hybrid"):
-            raise ValueError("steering_mode must be yaw, lateral or hybrid")
+        if steering_mode not in ("yaw", "lateral", "hybrid", "adaptive"):
+            raise ValueError("steering_mode must be yaw, lateral, hybrid or adaptive")
         if type(vertical_follow) is not bool:
             raise ValueError("vertical_follow must be a boolean")
         self._vertical_follow = vertical_follow
@@ -92,9 +100,11 @@ class OpenPoseMarkerControl:
         self._steering_mode = steering_mode
         self.horizontal_limit = yaw_limit
         self.tuning = tuning
+        self.marker_tuning = tuning != "upstream_reference"
         self.max_dt = max_dt
-        self.depth_filter_tau = DEPTH_FILTER_TAU if tuning == "marker_v2" else 0.
-        self.pitch_gains = PITCH_GAINS if tuning == "marker_v2" else UPSTREAM_PITCH_GAINS
+        self.depth_filter_tau = DEPTH_FILTER_TAU if self.marker_tuning else 0.
+        self.pitch_gains = (RESPONSIVE_PITCH_GAINS if tuning == "responsive_v1" else
+                            PITCH_GAINS if self.marker_tuning else UPSTREAM_PITCH_GAINS)
         self.yaw_pid = PID(*YAW_GAINS, setpoint=0, sample_time=None,
                            output_limits=(-yaw_limit*100, yaw_limit*100))
         self.pitch_pid = PID(*self.pitch_gains, setpoint=0, sample_time=None,
@@ -112,11 +122,20 @@ class OpenPoseMarkerControl:
         """Constructor-only routing; stop and construct a new instance to change."""
         return self._steering_mode
 
-    def _route_horizontal(self, value):
+    def _route_horizontal(self, value, offset=0.):
         if self.steering_mode == "yaw":
             return 0, value
         if self.steering_mode == "lateral":
             return value, 0
+        if self.steering_mode == "adaptive":
+            # Offset is a fraction of image half-width. Near the center,
+            # translate primarily; approaching an edge, preserve full yaw.
+            # Smooth spatial blend, no alternating mode switch or blind search.
+            # A single RC-number budget is shared; not equal physical effects.
+            blend = max(0., min(1., (abs(offset)-.15)/.40))
+            blend = blend*blend*(3.-2.*blend)
+            right = int(value*.8*(1.-blend))
+            return right, value-right
         # Split integer RC first. Rounding each half later could double an odd
         # unit. Give the remainder to yaw so alignment retains the first unit.
         right = int(value / 2)
@@ -154,7 +173,12 @@ class OpenPoseMarkerControl:
 
     def update(self, *, frame_id, acquired_at, center_x, image_width,
                size_ratio, reference_size, forward_allowed=True,
-               center_y=None, image_height=None, depth_error=None):
+               center_y=None, image_height=None, depth_error=None,
+               target_x_fraction=.5, target_y_fraction=.5):
+        if any(type(v) not in (int, float) or not math.isfinite(v) or not .15 <= v <= .85
+               for v in (target_x_fraction, target_y_fraction)):
+            raise ValueError('aim fractions must be within the central 70 percent of the image')
+        self.target_x_fraction, self.target_y_fraction = target_x_fraction, target_y_fraction
         values = (acquired_at, center_x, image_width, size_ratio, reference_size)
         if (type(frame_id) is not int or frame_id < 0
                 or any(type(v) not in (int, float) or not math.isfinite(v) for v in values)
@@ -184,7 +208,7 @@ class OpenPoseMarkerControl:
                 or (self._last_at is not None and acquired_at < self._last_at)):
             self.reason = "older_frame_or_time"
             return self._cached
-        if (self.tuning == "marker_v2" and self._reference_size is not None
+        if (self.marker_tuning and self._reference_size is not None
                 and reference_size != self._reference_size):
             # Normal FollowController.calibrate() has already reset the adapter.
             # Protect direct callers too, including a same-frame recalibration:
@@ -220,7 +244,7 @@ class OpenPoseMarkerControl:
         dt = 1e-16 if elapsed is None else elapsed
         self._reference_size = reference_size
         xoff = int(center_x/image_width*EQUIVALENT_FRAME_WIDTH
-                   - EQUIVALENT_FRAME_WIDTH/2)
+                   - EQUIVALENT_FRAME_WIDTH*target_x_fraction)
         size_delta = (size_ratio-reference_size)*EQUIVALENT_FRAME_WIDTH
         self.relative_depth_error = depth_error
         if depth_error is not None:
@@ -242,10 +266,10 @@ class OpenPoseMarkerControl:
             # same pixel scale on both axes. The marker aims at image midheight;
             # this is image alignment, NOT an altitude measurement or limit.
             # With top-left image origin, a target above center requests UP.
-            yoff = int((image_height/2 - center_y) * EQUIVALENT_FRAME_WIDTH/image_width)
+            yoff = int((image_height*target_y_fraction - center_y) * EQUIVALENT_FRAME_WIDTH/image_width)
             self.vertical_request = int(-self.throttle_pid(yoff, dt=dt))/100.0
         pitch = 0
-        if (forward_allowed and self.tuning == "marker_v2"
+        if (forward_allowed and self.marker_tuning
                 and abs(size_delta) <= DEPTH_REFERENCE_DEADBAND_PX):
             # With P=.5 and integer RC quantization, this region has no useful
             # proportional motion request. Clear I rather than retaining a
@@ -268,7 +292,7 @@ class OpenPoseMarkerControl:
                 self._filtered_size_delta += alpha*(size_delta-self._filtered_size_delta)
             low, high = self.pitch_pid.output_limits
             error = -self._filtered_size_delta
-            self.integral_paused = bool(self.tuning == "marker_v2"
+            self.integral_paused = bool(self.marker_tuning
                 and self._pitch_output is not None
                 and ((self._pitch_output >= high and error > 0)
                      or (self._pitch_output <= low and error < 0)))
@@ -290,7 +314,7 @@ class OpenPoseMarkerControl:
         self._last_frame, self._last_at = frame_id, acquired_at
         self.last_dt = elapsed
         self.reason = "new_frame" if forward_allowed else "depth_geometry_blocked"
-        right, yaw = self._route_horizontal(horizontal)
+        right, yaw = self._route_horizontal(horizontal, (center_x/image_width-target_x_fraction)*2.)
         self._cached = (right/100.0, pitch/100.0, yaw/100.0)
         return self._cached
 
@@ -299,7 +323,9 @@ class OpenPoseMarkerControl:
                 "parameter_set": self.tuning,
                 "steering_mode": self.steering_mode,
                 "horizontal_limit": self.horizontal_limit,
-                "horizontal_allocation": ("integer_half_lateral_remainder_yaw"
+                "horizontal_allocation": ("lateral_center_yaw_edge_shared_budget"
+                                           if self.steering_mode == "adaptive" else
+                                           "integer_half_lateral_remainder_yaw"
                                            if self.steering_mode == "hybrid"
                                            else self.steering_mode),
                 "horizontal_budget_unit": "sum of absolute RC numbers; not physical speed or thrust",
@@ -307,14 +333,14 @@ class OpenPoseMarkerControl:
                 "vertical": {"enabled": self.vertical_follow,
                              "profile": VERTICAL_PROFILE,
                              "gains": THROTTLE_GAINS, "limit": self.vertical_limit,
-                             "target_y_fraction": .5,
+                             "target_y_fraction": getattr(self, 'target_y_fraction', .5),
                              "raw_normalized_request": self.vertical_request,
                              "components": self.throttle_pid.components,
                              "physical_tuning_verified": False,
                              "altitude_limits_enforced": False},
                 "depth_filter_tau_s": self.depth_filter_tau,
                 "depth_reference_deadband_equivalent_px": (DEPTH_REFERENCE_DEADBAND_PX
-                                                            if self.tuning == "marker_v2" else 0),
+                                                            if self.marker_tuning else 0),
                 "depth_integral_paused": self.integral_paused,
                 "reference_size": self._reference_size,
                 "relative_depth_error": self.relative_depth_error,

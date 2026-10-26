@@ -46,6 +46,9 @@ _REASON_TEXT = {
     "timeout": "执行超时",
     "follow_no_frame_source": "没有可用画面来源，无法开始跟随",
     "follow_no_fresh_frame": "没有新鲜画面，无法开始跟随",
+    "follow_target_not_found": "当前画面未识别出0号标记；识别预览继续运行，标记清晰后请重新说开始跟随",
+    "follow_recognition_budget_exceeded": "标记识别超时；识别预览继续运行，识别稳定后请重新说开始跟随",
+    "ambiguous_duplicate_id": "画面中出现重复的目标标记，未启动跟随；请只保留一张0号标记可见",
     "follow_calibration_failed": "跟随校准失败",
 }
 
@@ -111,6 +114,14 @@ class UnifiedDrone:
             "owner": None if s.control_owner == "none" else s.control_owner,
             "following": _ctl.is_following(),
             "target_visible": follow.get('target_visible', False),
+            "recognition_running": follow.get('recognition_running', False),
+            "recognition_reason": follow.get('recognition_reason', 'not_running'),
+            "recognition_frame_id": follow.get('frame_id'),
+            "recognition_age_ms": follow.get('observation_age_ms'),
+            "last_follow_start_failure": follow.get('last_start_failure', ''),
+            "vertical_follow": follow.get('vertical_follow', False),
+            "vertical_guard_reason": follow.get('vertical_guard_reason', 'not_running'),
+            "follow_request_rc": follow.get('requested_channels', (0, 0, 0, 0)),
             "flight_state": 'landing' if pending else s.flight_state,
             "landing_pending": pending,
             "timestamp": s.timestamp,
@@ -186,6 +197,22 @@ class UnifiedDrone:
         text = "上升 %d 厘米完成" % cm if result.status == 'completed' else '上升请求已发送，完成尚未确认'
         return _command_result(result, text)
 
+    def _direction_move(self, name, label, owner, cm):
+        if _landing_in_progress():
+            return _landing_denied()
+        result = self._call(name, owner, cm)
+        text = '%s %d 厘米完成' % (label, cm) if result.status == 'completed' else '动作请求已发送，完成尚未确认'
+        return _command_result(result, text)
+
+    def move_back(self, owner, cm):
+        return self._direction_move('move_back', '后退', owner, cm)
+
+    def move_left(self, owner, cm):
+        return self._direction_move('move_left', '左移', owner, cm)
+
+    def move_right(self, owner, cm):
+        return self._direction_move('move_right', '右移', owner, cm)
+
     def move_down(self, owner, cm):
         if _landing_in_progress():
             return _landing_denied()
@@ -194,16 +221,31 @@ class UnifiedDrone:
         return _command_result(result, text)
 
     # --- 跟随 ---
+    def rotate(self, owner, degrees):
+        if _landing_in_progress():
+            return _landing_denied()
+        result = self._call('rotate', owner, degrees)
+        text = ('%s %d 度完成' % ('右转' if degrees > 0 else '左转', abs(degrees))
+                if result.status == 'completed' else '旋转请求已发送，完成尚未确认')
+        return _command_result(result, text)
+
+    def prepare_follow_preview(self):
+        return _ctl._follow.prepare_preview()
+
     def start_follow(self):
+        if self._cancelled():
+            return dict(ok=False, message='本轮已取消，不启动跟随')
         if _landing_in_progress():
             return _landing_denied()
         # 控制权由 3组 跟随服务内部申请，这里不能预先 request_control('follow')，
         # 否则第二次申请会返回 busy，跟随永远起不来。
-        result = _ctl.start_follow()
+        result = _ctl.start_follow(cancelled=self._cancelled)
         if not result.ok:
             message = _REASON_TEXT.get(result.reason, result.reason or "无法开始跟随")
             return {"ok": False, "message": message, "simulated": _driver.SIMULATED}
-        return {"ok": True, "message": "已开始跟随", "simulated": _driver.SIMULATED}
+        return {"ok": True, "message": ("跟随模式仍开启，正在等待标记恢复"
+                    if result.reason == 'waiting_for_target' else "已开始跟随"),
+                "simulated": _driver.SIMULATED}
 
     def stop_follow(self):
         # 3组 的 stop 内部已完成「0 速度 + 释放控制权」，这里不要再 release 一次。
@@ -218,6 +260,8 @@ class UnifiedDrone:
         return _ctl.is_following()
 
     def pause_follow_for_action(self):
+        if self._cancelled():
+            return dict(ok=False, message='本轮已取消，不接管跟随')
         result, ticket = _ctl._follow.pause_for_action()
         return dict(ok=result.ok, ticket=ticket, message=result.reason, simulated=_driver.SIMULATED)
 
@@ -226,3 +270,29 @@ class UnifiedDrone:
             return _landing_denied()
         result = _ctl._follow.finish_action(ticket, status)
         return dict(ok=result.ok, message=result.reason, simulated=_driver.SIMULATED)
+
+    def finish_follow_adjustment(self, ticket, status, axis):
+        completed_at = time.time()
+        deadline = time.monotonic() + .8
+        while True:
+            if self._cancelled() or _landing_in_progress():
+                _ctl._follow.finish_action(ticket, 'failed')
+                return dict(ok=False, message='本轮已取消或正在降落，不恢复跟随')
+            result = _ctl._follow.finish_action(ticket, status,
+                        adjust_axis=axis, not_before=completed_at)
+            if result.reason != 'awaiting_post_action_frame' or time.monotonic() >= deadline:
+                if result.reason == 'awaiting_post_action_frame':
+                    _ctl._follow.finish_action(ticket, 'failed')
+                return dict(ok=result.ok, message=result.reason, simulated=_driver.SIMULATED)
+            time.sleep(.02)
+
+    def emergency(self, land):
+        # Invalidate action grants BEFORE waiting on follow cleanup/telemetry.
+        _driver.cancel_pending('voice_land' if land else 'voice_stop')
+        result = (_ctl.land('model', priority=True) if land
+                  else _ctl.stop_motion('model', priority=True, release_on_stop=True))
+        _ctl.stop_follow()
+        return dict(ok=result.ok, status=result.status, land=land,
+                    control_released=bool(result.ok and not land),
+                    message=('降落请求已发送，落地尚未确认' if land else
+                             '悬停请求已发送，停止尚未确认') if result.ok else result.reason)

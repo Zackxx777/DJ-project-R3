@@ -12,7 +12,7 @@ from dataclasses import replace
 HERE = Path(__file__).resolve().parent
 PACKAGE = HERE.parents[1]
 SOURCE = HERE
-EXPECTED_VERSION = 'r3-9a7d2a1-braking1'
+EXPECTED_VERSION = 'r3-motion-follow1'
 EXPECTED_PROFILE = 'openpose_pid_marker_v2'
 
 

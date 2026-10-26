@@ -102,6 +102,7 @@ class ApparentSizeGuard:
     def __init__(self, required=False, confirmation_max_gap=.2):
         self.enabled = required
         self.confirmation_max_gap = confirmation_max_gap
+        self.confirmation_min_s = .2
         self.shape = None
         self.blocked = required
         self.reason = "geometry_missing" if required else "scalar_simulation_only"
@@ -149,7 +150,7 @@ class ApparentSizeGuard:
             self.last_good = obs.acquired_at
             self.good_count += 1
             self.reason = "waiting_for_stable_shape"
-            if self.good_count >= 3 and obs.acquired_at-self.good_since >= .2 - FRAME_TIME_EPSILON:
+            if self.good_count >= 3 and obs.acquired_at-self.good_since >= self.confirmation_min_s - FRAME_TIME_EPSILON:
                 self.blocked, self.reason = False, "clear"
 
     def calibrate(self, obs):
@@ -176,7 +177,13 @@ class FollowController:
                  forward_limit=0.30,
                  alignment_stop=0.30, alignment_resume=0.18,
                  control_profile="legacy", vertical_follow=False,
-                 distance_mode="apparent_pixels", pose_estimator=None):
+                 distance_mode="apparent_pixels", pose_estimator=None, pid_tuning="marker_v2",
+                 reference_size_limit=None):
+        if reference_size_limit is not None and (
+                type(reference_size_limit) not in (int, float) or not math.isfinite(reference_size_limit)
+                or not .05 <= reference_size_limit <= .30 or distance_mode != 'relative_size'):
+            raise ValueError('invalid relative reference_size_limit')
+        self.reference_size_limit = reference_size_limit
         if max_age <= 0 or not math.isfinite(max_age):
             raise ValueError("max_age must be finite and positive")
         self.target_id = target_id
@@ -192,6 +199,10 @@ class FollowController:
         self.max_request_rate = max_request_rate
         if control_profile not in ("legacy", "openpose_pid"):
             raise ValueError("control_profile must be legacy or openpose_pid")
+        if pid_tuning not in ("marker_v2", "responsive_v1"):
+            raise ValueError("unsupported pid_tuning")
+        if pid_tuning != "marker_v2" and control_profile != "openpose_pid":
+            raise ValueError("responsive tuning requires openpose_pid")
         if distance_mode not in ("apparent_pixels", "relative_size", "pose"):
             raise ValueError("unsupported distance_mode")
         if distance_mode != "apparent_pixels" and control_profile != "openpose_pid":
@@ -211,10 +222,10 @@ class FollowController:
         # lateral/hybrid require explicit selection. Explicit None is invalid.
         if steering_mode is _DEFAULT_STEERING:
             steering_mode = "yaw" if control_profile == "openpose_pid" else "lateral"
-        if steering_mode not in ("lateral", "yaw", "hybrid"):
-            raise ValueError("steering_mode must be lateral, yaw or hybrid")
-        if steering_mode == "hybrid" and control_profile != "openpose_pid":
-            raise ValueError("hybrid steering requires openpose_pid")
+        if steering_mode not in ("lateral", "yaw", "hybrid", "adaptive"):
+            raise ValueError("steering_mode must be lateral, yaw, hybrid or adaptive")
+        if steering_mode in ("hybrid", "adaptive") and control_profile != "openpose_pid":
+            raise ValueError("combined steering requires openpose_pid")
         for name, value in (("yaw_limit", yaw_limit),
                             ("forward_limit", forward_limit),
                             ("alignment_stop", alignment_stop),
@@ -229,6 +240,7 @@ class FollowController:
         self._openpose = (OpenPoseMarkerControl(yaw_limit=yaw_limit,
                                                forward_limit=forward_limit,
                                                max_dt=max_age,
+                                               tuning=pid_tuning,
                                                steering_mode=steering_mode,
                                                vertical_follow=vertical_follow)
                           if control_profile == "openpose_pid" else None)
@@ -239,20 +251,28 @@ class FollowController:
         self.alignment_stop = alignment_stop
         self.alignment_resume = alignment_resume
         self._alignment_blocked = steering_mode == "yaw" and self._openpose is None
-        self._depth_brake = DepthBrake(forward_limit)
+        self._depth_brake = DepthBrake(forward_limit, proportional_scale=(
+            self._openpose.pitch_gains[0]*128/100 if self._openpose else .64),
+            braking_allowance=.40 if pid_tuning == 'responsive_v1' else .25)
         self._motion_at = None
         self._motion_values = (0.0, 0.0, 0.0, 0.0)
         self._loss_at = None
+        self._last_found = None
+        self._recovery_anchor = None
+        self._quick_recovery = False
+        self.fast_reacquire = pid_tuning == 'responsive_v1'
         self._good_since = None
         self._good_count = 0
         self.state = State.STOPPED
         self.reference_size = None
+        self.target_x_fraction = self.target_y_fraction = .5
         self.observation = None
         self._last_frame_id = -1
         self._source = None
         self._invalid = False
         self.last_request = MotionRequest(self.state)
         self.last_stop_reason = ""
+        self.last_observation_rejection = ""
         self.confirmation_max_gap = max_age if distance_mode != "apparent_pixels" else .2
         self.distance_guard = ApparentSizeGuard(required=require_geometry,
                                                confirmation_max_gap=self.confirmation_max_gap)
@@ -286,7 +306,9 @@ class FollowController:
 
     def observe(self, obs):
         """Only newer frames from the same source may replace current data."""
+        self.last_observation_rejection = ""
         if not self._valid(obs):
+            self.last_observation_rejection = "invalid_fields_or_target"
             self._depth_brake.reset("invalid_input")
             self._invalid = True
             self.distance_guard.block("invalid_input")
@@ -294,15 +316,19 @@ class FollowController:
                 self._openpose.reset()
             return False
         if self._source is not None and obs.source != self._source:
+            self.last_observation_rejection = "source_changed"
             self._invalid = True
             return False  # source switch requires a new controller/calibration
         if self._image_size is not None and self._image_size != (obs.width, obs.height):
+            self.last_observation_rejection = "image_size_changed"
             self._invalid = True
             self.last_stop_reason = "image_size_changed_requires_new_session"
             return False
         if obs.frame_id <= self._last_frame_id:
+            self.last_observation_rejection = "frame_id_not_advancing"
             return False  # duplicates never refresh the stored timestamp
         if self.observation is not None and obs.acquired_at <= self.observation.acquired_at:
+            self.last_observation_rejection = "capture_time_not_advancing"
             self._invalid = True
             self.distance_guard.block("nonadvancing_frame_time")
             if self._openpose:
@@ -327,16 +353,28 @@ class FollowController:
                     self._good_since, self._good_count = obs.acquired_at, 1
                 else:
                     self._good_count += 1
+                anchor = self._recovery_anchor
+                candidate_fast = bool(self.fast_reacquire and anchor is not None
+                    and self._good_since-anchor.acquired_at <= .15
+                    and abs(obs.center_x/obs.width-anchor.center_x/anchor.width) <= .08
+                    and abs(obs.center_y/obs.height-anchor.center_y/anchor.height) <= .08
+                    and abs(obs.size_ratio/anchor.size_ratio-1) <= .12
+                    and ApparentSizeGuard.suitable(marker_shape(obs.corners), strict=True))
+                self._quick_recovery = candidate_fast and (self._good_count == 1 or self._quick_recovery)
             else:
                 self._good_since, self._good_count = None, 0
+                self._quick_recovery = False
         self._source = obs.source
         self._image_size = (obs.width, obs.height)
         self._last_frame_id = obs.frame_id
         self.observation = obs
+        if obs.found:
+            self._last_found = obs
         self._invalid = False
         if self._openpose and not obs.found:
             self._openpose.reset()
             self._depth_brake.reset("target_unavailable")
+        self.distance_guard.confirmation_min_s = .05 if self._quick_recovery else .2
         self.distance_guard.observe(obs)
         if self.pose_estimator is not None:
             self.pose = self.pose_estimator.estimate(obs)
@@ -345,6 +383,8 @@ class FollowController:
     def _clear_recovery(self):
         self._loss_at = self._good_since = None
         self._good_count = 0
+        self._recovery_anchor = None
+        self._quick_recovery = False
 
     def _issue(self, now):
         if self._invalid or not isinstance(now, (int, float)) or not math.isfinite(now):
@@ -382,8 +422,33 @@ class FollowController:
         elif not self.distance_guard.calibrate(self.observation):
             return False, "Front-facing marker geometry required for reference"
         self.reference_size = self.observation.size_ratio
+        # A close startup/rebase must not teach the controller to chase to that
+        # same close point. This is an image-size cap, NOT calibrated metres.
+        if self.reference_size_limit is not None:
+            self.reference_size = min(self.reference_size, self.reference_size_limit)
         self._zero("reference_updated")
         return True, "Reference size saved"
+
+    def rebase_axis(self, axis, now):
+        """Preserve only the manually adjusted axis using a fresh observation."""
+        if self.state != State.PAUSED or self._issue(now):
+            return False, 'fresh_paused_target_required'
+        if axis == 'depth':
+            return self.calibrate(now)
+        if axis not in ('horizontal', 'vertical'):
+            return False, 'invalid_adjustment_axis'
+        if axis == 'vertical' and (self._openpose is None or not self._openpose.vertical_follow):
+            return False, 'vertical_follow_disabled'
+        obs = self.observation
+        value = obs.center_x/obs.width if axis == 'horizontal' else obs.center_y/obs.height
+        if not .15 <= value <= .85:
+            return False, 'target_too_close_to_image_edge'
+        if axis == 'horizontal':
+            self.target_x_fraction = value
+        else:
+            self.target_y_fraction = value
+        self._zero('reference_updated')
+        return True, 'adjustment_reference_saved'
 
     def start(self, now):
         self._clear_recovery()
@@ -425,7 +490,8 @@ class FollowController:
 
     def status(self):
         return {"state": str(self.state), "target_id": self.target_id,
-                "reference_size": self.reference_size, "request": self.last_request,
+                "reference_size": self.reference_size, "reference_size_limit": self.reference_size_limit,
+                "request": self.last_request,
                 "last_stop_reason": self.last_stop_reason,
                 "control_profile": (OPENPOSE_PROFILE if self._openpose else
                                     "visible_target_yaw_v1" if self.steering_mode == "yaw"
@@ -470,8 +536,9 @@ class FollowController:
                 self.state = State.LOST
                 self._clear_recovery()
                 return self._zero("recovery_timeout_requires_start")
+            confirmation = .05 if self._quick_recovery else .15
             if (issue is None and self._good_count >= 3 and self._good_since is not None
-                    and self.observation.acquired_at-self._good_since >= .15-FRAME_TIME_EPSILON):
+                    and self.observation.acquired_at-self._good_since >= confirmation-FRAME_TIME_EPSILON):
                 self.state = State.TRACKING
                 self._clear_recovery()
             else:
@@ -480,6 +547,8 @@ class FollowController:
               and self.observation.reason in RECOVERABLE_MISS_REASONS):
             self.state = State.RECOVERING
             self._loss_at = now
+            self._recovery_anchor = self._last_found
+            self._quick_recovery = False
             self._good_since, self._good_count = None, 0
             return self._zero("brief_loss_zero_request")
         if issue:
@@ -490,7 +559,7 @@ class FollowController:
                       and self.observation.reason else str(issue))
             return self._zero(reason)
         obs = self.observation
-        x_error = 2 * obs.center_x / obs.width - 1
+        x_error = 2 * (obs.center_x / obs.width - self.target_x_fraction)
         scale_error = (self.reference_size - obs.size_ratio) / self.reference_size
 
         def adjustment(error, limit=0.3):
@@ -524,7 +593,8 @@ class FollowController:
                 center_x=obs.center_x, image_width=obs.width,
                 size_ratio=obs.size_ratio, reference_size=self.reference_size,
                 forward_allowed=depth_status["forward_allowed"],
-                center_y=obs.center_y, image_height=obs.height, depth_error=depth_error)
+                center_y=obs.center_y, image_height=obs.height, depth_error=depth_error,
+                target_x_fraction=self.target_x_fraction, target_y_fraction=self.target_y_fraction)
             desired += (self._openpose.vertical_request,)
             if depth_status["forward_allowed"] and depth_error is not None:
                 forward = self._depth_brake.limit(desired[1],frame_id=obs.frame_id,
@@ -547,6 +617,15 @@ class FollowController:
             forward_blocked = self.distance_guard.blocked or self._alignment_blocked
             desired = (right, 0.0 if forward_blocked
                        else adjustment(scale_error, self.forward_limit), yaw, 0.0)
+        # Trend lead and filtered PID history cannot request forward motion
+        # when the latest valid measurement is already at/inside the setpoint.
+        # Keep normal far-target chase and early approach braking unchanged.
+        at_or_inside = (depth_error is not None and depth_error <= 0
+                        if self._openpose and self.distance_mode == 'pose'
+                        else obs.size_ratio >= self.reference_size)
+        near_forward_blocked = at_or_inside and desired[1] > 0
+        if near_forward_blocked:
+            desired = (desired[0], 0., desired[2], desired[3])
         if (self._openpose and self.distance_mode != 'apparent_pixels'
                 and self.last_request.forward*desired[1] < 0):
             # Zero-crossing is required even when acceleration smoothing is
@@ -566,7 +645,9 @@ class FollowController:
                 return previous + max(-step, min(step, target-previous))
             desired = tuple(ramp(old,new,index) for index,(old,new) in enumerate(zip(self._motion_values,desired)))
             self._motion_values, self._motion_at = desired, now
-        if not self.distance_status()["forward_allowed"]:
+        if near_forward_blocked:
+            reason = 'at_or_inside_reference_no_forward'
+        elif not self.distance_status()["forward_allowed"]:
             reason = "distance_guard: " + self.distance_status()["reason"]
         elif self._alignment_blocked:
             reason = "turn_to_align_before_depth"

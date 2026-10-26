@@ -166,6 +166,7 @@ class VolcDuplex:
         self.ws = None
         self.ready = asyncio.Event()
         self.send_lock = asyncio.Lock()
+        self.action_lock = asyncio.Lock()
         self.downsampler = Downsampler()
         self.session_id = None
         self.epoch = 0
@@ -471,12 +472,29 @@ class VolcDuplex:
             code = arguments.get('code')
             if not isinstance(code, str) or not code.strip():
                 raise ValueError('code 不能为空')
-            result = self.runner.run(code)
-            # SandboxRunner.run 是 async：直接 await to_thread 只会拿到未 await 的协程，
-            # 工具结果永远是空的（实测报 RuntimeWarning: coroutine was never awaited）
-            if inspect.isawaitable(result):
-                result = await result
-            return result
+            epoch = self.epoch
+            async with self.action_lock:
+                if epoch != self.epoch:
+                    return {'ok': False, 'status': 'cancelled', 'reason': 'stale_turn'}
+                if inspect.iscoroutinefunction(self.runner.run):
+                    return await self.runner.run(code)
+                def execute():
+                    if epoch != self.epoch:
+                        return {'ok': False, 'status': 'cancelled', 'reason': 'stale_turn'}
+                    if hasattr(self.runner, 'run_guarded'):
+                        return self.runner.run_guarded(code, lambda: epoch != self.epoch)
+                    return self.runner.run(code)
+                worker = asyncio.create_task(asyncio.to_thread(execute))
+                try:
+                    result = await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    # A Python thread cannot be cancelled by cancelling its await.
+                    # Keep the action lock until it really returns.
+                    await worker
+                    raise
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
         if name == 'get_status':
             backend = self._backend()
             if backend is not None:
@@ -489,6 +507,7 @@ class VolcDuplex:
                 state = await asyncio.to_thread(drone.get_status)
             return {'ok': True, 'status': 'ok', 'state': state}
         if name == 'interrupt':
+            self.epoch += 1
             land = _coerce_bool(arguments.get('land'))
             if hasattr(self.runner, 'cancel'):
                 self.runner.cancel()
@@ -502,6 +521,8 @@ class VolcDuplex:
             drone = getattr(getattr(self.runner, 'demo', None), 'drone', None)
             if drone is None:
                 raise RuntimeError('当前执行器不支持打断')
+            if hasattr(drone, 'emergency'):
+                return await asyncio.to_thread(drone.emergency, land)
             # 不同执行器的 drone 接口签名不一致（有的要 owner，有的不要），两种都兜住
             def _call(method):
                 try:
@@ -517,18 +538,18 @@ class VolcDuplex:
             try:
                 result = _call(drone.land) if land else _call(drone.stop_motion)
             except Exception:
-                result = {}
+                result = {'ok': False}
             if not _ok(result):
                 # 被 controller 的占用/代次挡住（obsolete_control / no_control）时，
                 # 必须走 priority 强制通道 —— 否则用户喊急停实际上什么都没发生
                 from drone_sdk import controller as ctl
                 result = (ctl.land('model', priority=True) if land
-                          else ctl.stop_motion('model', priority=True)) or {}
+                          else ctl.stop_motion('model', priority=True, release_on_stop=True)) or {}
             if isinstance(result, dict):
                 ok = bool(result.get('ok', True))
-                message = result.get('message') or '已急停'
+                message = result.get('message') or '停止请求已发送，实际停止尚未确认'
             else:                      # controller 返回 CommandResult
                 ok = bool(getattr(result, 'ok', True))
-                message = str(getattr(result, 'reason', '') or '已急停')
+                message = str(getattr(result, 'reason', '') or '停止请求已发送，实际停止尚未确认')
             return {'ok': ok, 'land': land, 'message': message}
         raise ValueError('未知工具：' + str(name))

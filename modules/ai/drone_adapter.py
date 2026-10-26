@@ -51,6 +51,25 @@ class MockDrone:
         return self.result(True, '模拟停止运动')
 
     def move_forward(self, owner, cm):
+        return self._move(owner, cm, '前进')
+
+    def move_back(self, owner, cm): return self._move(owner, cm, '后退')
+    def move_left(self, owner, cm): return self._move(owner, cm, '左移')
+    def move_right(self, owner, cm): return self._move(owner, cm, '右移')
+    def move_up(self, owner, cm): return self._move(owner, cm, '升高')
+    def move_down(self, owner, cm): return self._move(owner, cm, '降低')
+
+    def rotate(self, owner, degrees):
+        if self.owner != owner or not self.flying:
+            return self.result(False, '无控制权或未起飞')
+        if type(degrees) is not int or not 1 <= abs(degrees) <= 180:
+            return self.result(False, '旋转角度无效')
+        if self.fail_next_move:
+            self.fail_next_move = False
+            return self.result(False, '注入的模拟旋转失败')
+        return self.result(True, '模拟%s%d度完成' % ('右转' if degrees > 0 else '左转', abs(degrees)))
+
+    def _move(self, owner, cm, label):
         if self.owner != owner or not self.flying:
             return self.result(False, '无控制权或未起飞')
         if type(cm) is not int or not 20 <= cm <= 100:
@@ -58,7 +77,7 @@ class MockDrone:
         if self.fail_next_move:
             self.fail_next_move = False
             return self.result(False, '注入的模拟移动失败')
-        return self.result(True, '模拟前进%d厘米完成' % cm)
+        return self.result(True, '模拟%s%d厘米完成' % (label, cm))
 
     def start_follow(self):
         if not self.flying or not self.target_visible:

@@ -5,11 +5,15 @@
   "snapshot_commit": "727f2af",
   "r3_source_base": "4f586860bc7dbcf46dd8be97aa259fc7027d02a8",
   "r3_version": "r3-9a7d2a1-braking1",
-  "preserved_modules": [
+  "snapshot_preserved_modules": [
     "drone_sdk",
     "modules/ai"
   ],
-  "preserved_file_count": 66,
+  "snapshot_preserved_file_count": 66,
+  "current_integration_date": "2026-10-27",
+  "current_modified_modules": ["drone_sdk", "modules/ai", "modules/follow"],
+  "current_handoff": "docs/HANDOFF_20261027.md",
+  "note": "Preservation counts and r3_version describe the original import. Current integration modifies Group 2 and Group 4 code; the original snapshot remains at snapshot_commit.",
   "import_method": "independent repository, tracked source snapshot, original project history retained at upstream URL",
   "snapshot_date": "2026-10-26"
 }

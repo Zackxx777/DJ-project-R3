@@ -137,6 +137,9 @@ class ControllerBrakingTests(unittest.TestCase):
 
     def test_same_direction_deceleration_bypasses_ramp_but_acceleration_does_not(self):
         c=self.ready();c._motion_values=(0.,.3,0.,0.);c._motion_at=.0
+        # Forward ramp tests require an actually farther target. At the
+        # reference, the close-target guard correctly overrides a mocked PID.
+        c.observe(observation(1,.01,size=.15))
         with patch.object(c._openpose,'update',return_value=(0.,.1,0.)),patch.object(c._depth_brake,'limit',side_effect=lambda request,**kw:request):
             self.assertEqual(c.tick(.02).forward,.1)
         with patch.object(c._openpose,'update',return_value=(0.,.3,0.)),patch.object(c._depth_brake,'limit',side_effect=lambda request,**kw:request):
@@ -157,6 +160,7 @@ class ControllerBrakingTests(unittest.TestCase):
 
     def test_disabling_acceleration_limit_does_not_bypass_zero_crossing(self):
         c=self.ready();c.max_request_rate=None
+        c.observe(observation(1,.01,size=.15))
         with patch.object(c._depth_brake,'limit',return_value=.2):self.assertEqual(c.tick(.02).forward,.2)
         with patch.object(c._depth_brake,'limit',return_value=-.1):
             self.assertEqual(c.tick(.04).forward,0)

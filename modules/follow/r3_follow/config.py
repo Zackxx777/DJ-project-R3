@@ -37,8 +37,15 @@ class FollowConfig:
     marker_side_m: float | None = None
     vertical_min_height_cm: float = 50.0
     vertical_max_height_cm: float = 200.0
+    pid_tuning: str = "marker_v2"
+    reference_size_limit: float | None = None
 
     def __post_init__(self):
+        if self.reference_size_limit is not None:
+            value = self.reference_size_limit
+            if (type(value) not in (int, float) or not math.isfinite(value)
+                    or not .05 <= value <= .30 or self.distance_mode != 'relative_size'):
+                raise ValueError('reference_size_limit requires relative_size and a ratio in [.05, .30]')
         if (not isinstance(self.instance_id, str) or not self.instance_id.strip()
                 or self.instance_id != self.instance_id.strip()
                 or len(self.instance_id) > 80
@@ -50,10 +57,14 @@ class FollowConfig:
             raise ValueError("dictionary must be DICT_4X4_50")
         if self.control_profile not in ("legacy", "openpose_pid"):
             raise ValueError("control_profile must be legacy or openpose_pid")
-        if self.steering_mode not in ("yaw", "lateral", "hybrid"):
-            raise ValueError("steering_mode must be yaw, lateral or hybrid")
-        if self.steering_mode == "hybrid" and self.control_profile != "openpose_pid":
-            raise ValueError("hybrid steering requires openpose_pid")
+        if self.steering_mode not in ("yaw", "lateral", "hybrid", "adaptive"):
+            raise ValueError("steering_mode must be yaw, lateral, hybrid or adaptive")
+        if self.steering_mode in ("hybrid", "adaptive") and self.control_profile != "openpose_pid":
+            raise ValueError("combined steering requires openpose_pid")
+        if self.pid_tuning not in ("marker_v2", "responsive_v1"):
+            raise ValueError("pid_tuning must be marker_v2 or responsive_v1")
+        if self.pid_tuning != "marker_v2" and self.control_profile != "openpose_pid":
+            raise ValueError("responsive tuning requires openpose_pid")
         for name in ("yaw_limit", "forward_limit"):
             value = getattr(self, name)
             if (type(value) not in (int, float) or not math.isfinite(value)
@@ -101,7 +112,7 @@ def _from_mapping(value):
     allowed = required | {"physical_distance_m", "steering_mode",
                           "yaw_limit", "forward_limit", "max_request_rate", "vertical_follow",
                           "distance_mode", "camera_calibration", "camera_id", "marker_side_m",
-                          "vertical_min_height_cm", "vertical_max_height_cm"}
+                          "vertical_min_height_cm", "vertical_max_height_cm", "pid_tuning", "reference_size_limit"}
     keys = set(value)
     missing, unknown = required - keys, keys - allowed
     if missing:

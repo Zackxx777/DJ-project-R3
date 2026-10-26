@@ -12,7 +12,7 @@ from .contract import ControlResult
 
 REPOSITORY = Path(__file__).resolve().parent.parent
 MODULES_DIR = REPOSITORY / 'modules' / 'follow'
-FIRST_FRAME_TIMEOUT = 1.0
+FIRST_FRAME_TIMEOUT = 2.0
 # 目标丢失后保持"跟随模式"的窗口（秒）：窗口内持续零速度悬停，目标重新稳定出现
 # （连续 3 帧、≥0.15s）就自动恢复跟随；超过窗口才锁定为 target_lost 并要求显式重启。
 # 现场可用环境变量 R3_RECOVERY_WINDOW_S 临时调整，不必改代码。
@@ -31,6 +31,7 @@ class FollowIntegration:
         self._closing = False
         self._retired_workers = []
         self._pending_cleanup = []
+        self._last_start_failure = ''
 
     def set_frame_provider(self, provider):
         with self._lock:
@@ -58,15 +59,33 @@ class FollowIntegration:
     def _current(self, bridge, generation):
         return bridge is self._bridge and generation == self._generation
 
-    def _failed_start(self, bridge, generation, reason):
+    def prepare_preview(self):
+        """Run detection without acquiring control or starting following."""
+        with self._lock:
+            self._retired_workers = [w for w in self._retired_workers if w.is_alive()]
+            if self._starting or self._closing or self._retired_workers or self._pending_cleanup:
+                return self._fail('follow_start_or_close_busy')
+            try:
+                self._ensure_bridge()
+            except Exception as exc:
+                return self._fail('follow_unavailable: %s' % exc)
+            return ControlResult(ok=True, current_owner=self._owner_getter())
+
+    def _failed_start(self, bridge, generation, reason, *, keep_preview=False):
         with self._lock:
             if not self._current(bridge, generation):
                 return self._fail('follow_start_cancelled')
+            self._last_start_failure = reason
+            if keep_preview and bridge.service.lease is None:
+                # No movement was started. Keep observing so the HUD/status can
+                # recover, but require another explicit start request to move.
+                bridge.service.stop_follow(reason='start_failed: ' + reason)
+                return self._fail(reason)
         # stop checks the expected generation again; cannot close a newer start.
         self._stop(expected=(bridge, generation))
         return self._fail(reason)
 
-    def start(self, timeout=FIRST_FRAME_TIMEOUT):
+    def start(self, timeout=FIRST_FRAME_TIMEOUT, *, cancelled=None):
         deadline = time.monotonic() + max(0., float(timeout))
         with self._lock:
             pending=list(self._pending_cleanup)
@@ -92,8 +111,12 @@ class FollowIntegration:
         with self._lock:
             if self._starting or self._closing:
                 return self._fail('follow_start_or_close_busy')
-            if self._bridge is not None and self._bridge.is_following():
-                return ControlResult(ok=True, current_owner='follow')
+            if cancelled is not None and cancelled():
+                return self._fail('follow_start_cancelled')
+            if self._bridge is not None and self._bridge.get_follow_status().get('active'):
+                # A repeated voice request must not reset the existing loss
+                # deadline or tear down a recovering service.
+                return self._bridge.start_follow()
             self._generation += 1
             generation = self._generation
             self._starting = True
@@ -107,37 +130,40 @@ class FollowIntegration:
         try:
             if not has_provider and bridge.service.port.get_frame().frame is None:
                 return self._failed_start(bridge, generation, 'follow_no_frame_source')
+            reason = 'follow_no_fresh_frame'
             while True:
                 with self._lock:
                     if not self._current(bridge, generation):
                         return self._fail('follow_start_cancelled')
+                    if cancelled is not None and cancelled():
+                        return self._failed_start(bridge, generation, 'follow_start_cancelled', keep_preview=True)
                     with bridge.service.lock:
                         observation = bridge.service.controller.observation
                         fresh = bool(observation is not None and bridge.service.frame_ready
                             and 0 <= bridge.service.clock()-observation.acquired_at
                             <= bridge.service.controller.max_age)
-                if fresh:
-                    break
+                    if observation is not None and not observation.found:
+                        reason = ('follow_recognition_budget_exceeded' if 'budget_exceeded' in observation.reason
+                                  else 'follow_target_not_found')
+                        if observation.reason == 'ambiguous_duplicate_id':
+                            return self._failed_start(bridge, generation, 'ambiguous_duplicate_id', keep_preview=True)
+                    elif not fresh:
+                        reason = 'follow_no_fresh_frame'
+                    if fresh and observation.found:
+                        if bridge.service.controller.reference_size is None:
+                            calibrated = bridge.service.calibrate_reference()
+                            reason = None if calibrated.ok else (calibrated.reason or 'follow_calibration_failed')
+                        else:
+                            reason = None
+                        if reason is None:
+                            result = bridge.start_follow()
+                            if result.ok:
+                                self._last_start_failure = ''
+                                return result
+                            return self._failed_start(bridge, generation, result.reason)
                 if time.monotonic() >= deadline:
-                    return self._failed_start(bridge, generation, 'follow_no_fresh_frame')
+                    return self._failed_start(bridge, generation, reason, keep_preview=True)
                 time.sleep(.01)
-            with self._lock:
-                if not self._current(bridge, generation):
-                    return self._fail('follow_start_cancelled')
-                if bridge.service.controller.reference_size is None:
-                    calibrated = bridge.service.calibrate_reference()
-                    if not calibrated.ok:
-                        reason = calibrated.reason or 'follow_calibration_failed'
-                    else:
-                        reason = None
-                else:
-                    reason = None
-                if reason is None:
-                    result = bridge.start_follow()
-                    if result.ok:
-                        return result
-                    reason = result.reason
-            return self._failed_start(bridge, generation, reason)
         except Exception as exc:
             return self._failed_start(bridge, generation, 'follow_start_error: %s' % exc)
         finally:
@@ -182,13 +208,17 @@ class FollowIntegration:
             if self._bridge is None:
                 return dict(state='stopped', following=False,
                             background_running=any(w.is_alive() for w in self._retired_workers),
-                            target_visible=False)
+                            target_visible=False, recognition_running=False,
+                            last_start_failure=self._last_start_failure)
             service = self._bridge.service
             state = self._bridge.get_follow_status()
             with service.lock:
                 obs = service.controller.observation
                 state['target_visible'] = bool(service.frame_ready and obs and obs.found
                     and 0 <= service.clock()-obs.acquired_at <= service.controller.max_age)
+                state['recognition_running'] = bool(state.get('background_running'))
+                state['recognition_reason'] = obs.reason if obs is not None else 'waiting_for_first_frame'
+                state['last_start_failure'] = self._last_start_failure
             return state
 
     def events(self):
@@ -205,12 +235,13 @@ class FollowIntegration:
             result, ticket = self._bridge.pause_for_action()
             return self._bridge._control_result(result), (self._bridge, self._generation, ticket)
 
-    def finish_action(self, ticket, status):
+    def finish_action(self, ticket, status, *, adjust_axis=None, not_before=None):
         with self._lock:
             if ticket is None:
                 return self._fail('not_previously_following')
             bridge, generation, inner = ticket
             if not self._current(bridge, generation):
                 return self._fail('obsolete_ticket')
-            result = bridge.finish_action(inner, status)
+            result = (bridge.finish_action(inner, status) if adjust_axis is None else
+                      bridge.finish_action(inner, status, adjust_axis=adjust_axis, not_before=not_before))
             return bridge._control_result(result)

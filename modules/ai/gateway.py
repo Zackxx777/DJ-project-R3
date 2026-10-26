@@ -113,12 +113,19 @@ class Gateway:
     async def interrupt(self,land=False):
         # Set cancellation before any await. Does not wait for the movement thread.
         self.cancelled.set(); self.resume=False
+        generation = self.generation
         try:
             await asyncio.to_thread(self.backend.stop_follow)
             # 急停必须走底层 priority 通道：排队/动作锁都不能拦住它
             emergency=getattr(self.backend,'emergency',None)
             if callable(emergency):
-                return await asyncio.to_thread(emergency,land)
+                result = await asyncio.to_thread(emergency,land)
+                if (generation == self.generation and result.get('ok')
+                        and result.get('control_released') and not land):
+                    # The hover already revoked/released this turn's lease.
+                    # A later finish must not stop/release the next owner.
+                    self.acquired=False; self.ticket=None
+                return result
             control=await asyncio.to_thread(self.backend.request_control,'model')
             if not control.get('ok'): return {'ok':False,'reason':'control_busy','detail':control}
             self.acquired=True

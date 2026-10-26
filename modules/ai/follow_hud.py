@@ -11,6 +11,11 @@ RUN_LIFECYCLE = ('start', 'pause', 'stop', 'tracking_halted', 'fault',
                  'handoff_pause', 'handoff_finish', 'cleanup_completed')
 
 
+def running(life):
+    return bool(life and (life.get('event') == 'start' or
+                (life.get('event') == 'handoff_finish' and life.get('status') == 'completed')))
+
+
 def follow_snapshot(controller=None):
     """从 controller 的事件流里取最近一条 observation / motion_request / halt / lifecycle。"""
     if controller is None:
@@ -37,7 +42,7 @@ def follow_snapshot(controller=None):
 
 def follow_line(obs, mot, life=None):
     """终端的一行跟随状态。静止状态只在变化时打印，避免"未启动"刷屏盖住别的日志。"""
-    if life is not None and life.get('event') != 'start':
+    if life is not None and not running(life):
         reason = life.get('reason') or life.get('state') or life.get('event')
         return '[跟随] 未在跟随（%s）—— 说「开始跟随」重新启动' % reason
     if obs is None:
@@ -62,7 +67,7 @@ def follow_status_text(life):
     if life is None:
         return 'follow: NOT STARTED  -> say "start following"', (0, 165, 255)
     name = life.get('event')
-    if name == 'start':
+    if running(life):
         return 'follow: RUNNING', (0, 255, 0)
     if name in ('pause', 'handoff_pause'):
         return 'follow: PAUSED  reason=%s' % (life.get('reason') or '-'), (0, 165, 255)
@@ -102,13 +107,18 @@ def draw_follow_overlay(frame, obs=None, mot=None, halt=None, life=None):
         if obs.get('detection_ms') is not None:
             budget = obs.get('processing_budget')
             lines.append('detect=%.0f ms%s' % (
-                obs['detection_ms'], '' if budget is None else '  budget=%s' % budget))
+                obs['detection_ms'], '' if not isinstance(budget, dict) else '  budget=%s ms' % budget.get('limit_ms')))
     elif obs is not None:
         lines.append('waiting for marker  reason=%s' % (obs.get('reason') or '-'))
     if mot is not None:
         channels = mot.get('channels') or [0, 0, 0, 0]
-        lines.append('v  L%+d F%+d U%+d Y%+d  %s' % (
+        lines.append('RC  R%+d F%+d U%+d Y%+d  %s' % (
             channels[0], channels[1], channels[2], channels[3], mot.get('state')))
+        if mot.get('requested_up_rc') is not None:
+            direction = 'UP' if channels[2] > 0 else 'DOWN' if channels[2] < 0 else 'HOLD'
+            lines.append('vertical %s: request=%+d sent=%+d height=%s cm [%s]' % (
+                direction, mot['requested_up_rc'], channels[2], mot.get('height_cm'),
+                mot.get('vertical_guard_reason', '-')))
         if mot.get('reason'):
             lines.append('motion reason: %s' % mot.get('reason'))
     lines.append(status)

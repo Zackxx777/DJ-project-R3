@@ -19,6 +19,27 @@ EMERGENCY_HELP = ('急停：Ctrl+Shift+Alt+A = 零速度悬停   Ctrl+Shift+Alt+
                   '（任何窗口聚焦都有效）\n'
                   '备选（终端热键）：F12 = 零速度悬停   F11 = 立即降落')
 
+LOCAL_VOICE_INSTRUCTIONS = '''你是AI随行小伙伴，通过耳机用中文简短交流，声音由AI生成。
+这是本地单接口执行器。run_program每次只提交一条drone.xxx()，禁止import、变量、循环和多步程序。
+允许：drone.takeoff()、drone.land()、drone.stop_motion()、drone.start_follow()、drone.stop_follow()、
+drone.get_status()、drone.get_battery()，以及六方向drone.move_forward/back/left/right/up/down(cm)。
+用户只说向左转/左转时调用drone.turn_left()，只说向右转/右转时调用drone.turn_right()，执行器默认90度。
+用户指定角度时保留原数值，例如向左转45度调用drone.turn_left(45)，向右转30度调用drone.turn_right(30)。
+转向角度为1至180的整数。原drone.rotate(degrees)仍可用，正数右转、负数左转；向后转调用rotate(180)。
+“向前转”没有唯一角度，先问向左还是向右转多少度；不能当作前进，也不能承诺返回原朝向。
+旋转前执行器停止跟随，旋转后不自动跟随，以免转向立刻被跟随撤销。
+查询实时状态优先调用get_status工具。没有observe、get_frame、update_velocity等接口；
+没有接通视觉问答，不能声称看到人物、物品或现场细节。跟随识别的是指定0号标记，不是人脸。
+target_visible只表示本次状态对应的新鲜标记检测。recognition_running=false表示识别未运行，不能说用户没拿标记。
+用户问是否看到标记，必须重新查询状态，结合recognition_running、recognition_reason回答，不沿用旧结果。
+用户明确说开始、继续、跟随我时，调用一次drone.start_follow()并按本次结果回答；
+不能因为历史target_visible=false或以前启动失败而仅口头拒绝。启动失败后不自行重复调用，等用户的新指令。
+程序格式通过不等于运动成功，只按ok、status、result反馈。请求接受不等于实际停止或已经落地。
+用户说停、别动、降落，优先调用interrupt工具；打断后不自动续飞。
+悬停停止当前运动，不需要靠降落和重新起飞来恢复跟随。用户明确说继续跟随时调用drone.start_follow()。
+仅询问如何结束悬停不等于要求降落；解释可以说继续跟随或给出新的移动指令，等待明确指令再执行。
+状态不能证明实际位移、避障或导航到达，无法确认时应如实说明。'''
+
 # 图传窗口的后台监视器：主线程被 input() 占住，所以画面与跟随状态都放到守护线程里刷
 _VIEW = {'thread': None, 'stop': None, 'window': 'Tello Follow HUD'}
 
@@ -257,7 +278,7 @@ def build_real_runner(args):
             print('[安全] 真机起飞被拒绝：电量 %s%% < %d%%' % (battery, args.min_battery))
             return dict(ok=False, status='failed', simulated=False,
                         message='电量 %s%% 未满足 %d%%门限，拒绝起飞' % (battery, args.min_battery))
-        print('[安全] 真机起飞已授权（电量 %s%%，桨叶必须已拆除）' % (battery,))
+        print('[实飞] 起飞已授权，等待本次起飞结果（电量 %s%%）' % (battery,))
         result = original_takeoff(owner)
         if not result.get('ok'):
             last_error = str(drv.health().get('last_error') or '')
@@ -269,16 +290,23 @@ def build_real_runner(args):
                 else:
                     print('       → 检查桨叶是否装反（正/反桨必须对角对应）、飞机是否水平静置。')
         else:
-            climb_after_takeoff(args, drv, owner)
+            climb_after_takeoff(args, drv, owner, drone=drone)
         return result
     drone.takeoff = guarded_takeoff
 
     print('真机动作授权：起飞=%s，电量阈值 %d%%' % (
         '允许' if args.allow_real_takeoff else '禁止', args.min_battery))
-    return Runner(Demo(drone), allow_simulated_sdk=True, allow_programs=True), drone
+    if video_ready:
+        preview = ctl._follow.prepare_preview()
+        print('[识别] ' + ('预览已开启，识别到0号标记会显示绿框；跟随仍需明确指令'
+                          if preview.ok else '预览未开启：' + preview.reason), flush=True)
+    lateral_frame = os.environ.get('R3_VOICE_LATERAL_FRAME', 'aircraft')
+    print('[语音方向] ' + ('左右平移和转向按你面对机头时的左右；自动跟随仍按摄像头坐标'
+                          if lateral_frame == 'facing_pilot' else '左右按飞机自身朝向'))
+    return Runner(Demo(drone, lateral_frame=lateral_frame), allow_simulated_sdk=True, allow_programs=True), drone
 
 
-def climb_after_takeoff(args, drv, owner, timeout=8.0):
+def climb_after_takeoff(args, drv, owner, timeout=8.0, drone=None):
     """起飞后把高度补到 --climb-target-cm（默认 120cm）：Tello 只升到约 1m，
     摄像头平视，站着举 ArUco 才够得着。一次性离散上升，不做连续闭环。"""
     target = getattr(args, 'climb_target_cm', 120)
@@ -289,19 +317,26 @@ def climb_after_takeoff(args, drv, owner, timeout=8.0):
     deadline = time.monotonic() + timeout
     try:
         while time.monotonic() < deadline:
-            height = drv.health()['height_cm']
+            if drone is not None and drone._cancelled():
+                return
+            info = drv.health()
+            height = info['height_cm']
+            if not info.get('simulated', True) and info.get('height_timestamp') is None:
+                print('[高度] 遥测高度未确认，不补高')
+                return
             if type(height) is not int:
                 print('[高度] 读不到真实高度（%s），不做自动升高' % (height,))
                 return
             remaining = target - height
-            if remaining <= 15:
+            if remaining < 20:
                 print('[高度] 当前 %dcm，已接近目标 %dcm' % (height, target))
                 return
             step = int(min(50, remaining))
             print('[高度] %dcm → 目标 %dcm，上升 %dcm' % (height, target, step))
-            result = ctl.move_up(owner, step)
-            if not result.ok:
-                print('[高度] 上升被拒绝：%s（高度保持不变）' % (result.reason,))
+            result = (drone.move_up(owner, step) if drone is not None else ctl.move_up(owner, step))
+            ok = result.get('ok') if isinstance(result, dict) else result.ok
+            if not ok:
+                print('[高度] 补高未完成，保持当前状态；请查询高度')
                 return
             time.sleep(1.0)          # 等遥测刷新再判断下一步
     except Exception as exc:
@@ -408,16 +443,27 @@ async def run_modern(args):
                 instructions = INSTRUCTIONS
                 if not sandbox_ready:
                     # 本地白名单执行器只认单条调用；不告诉模型它会一直写多步程序被拒
-                    instructions = (INSTRUCTIONS +
-                                    '\n【当前运行环境】没有沙箱，run_program 只接受**单条** '
-                                    'drone.xxx() 调用（例如 drone.takeoff()、drone.get_status()），'
-                                    '不要写循环、多步动作、赋值或 import；'
-                                    '需要多步请分多次调用。查询状态优先用 get_status 工具。')
+                    instructions = LOCAL_VOICE_INSTRUCTIONS
+                    instructions += ('\n六方向接口为 drone.move_forward(cm)、drone.move_back(cm)、'
+                        'drone.move_left(cm)、drone.move_right(cm)、drone.move_up(cm)、drone.move_down(cm)。'
+                        'cm 是20至100的整数，必须保留用户指定距离，不得把50改成60；未指定时使用20厘米。'
+                        '跟随中的移动由执行器暂停、调整基准并按实际条件恢复，勿额外调用停止或启动跟随。'
+                        'accepted只表示程序格式通过；必须根据ok、status、result反馈。'
+                        '失败后不要自行换接口重试同一个运动，更不能把accepted当动作完成。')
+                    if runner.demo.lateral_frame == 'facing_pilot':
+                        instructions += ('\n用户面对机头时的平移和转向均由执行器转换：向左移动调用move_left，'
+                            '向右移动调用move_right；向左转调用turn_left或rotate(负角度)，'
+                            '向右转调用turn_right或rotate(正角度)。不要再次交换接口或翻转正负。'
+                            '这个约定不代表系统知道用户转身后的朝向。')
+                    else:
+                        instructions += '\n平移左右按飞机自身朝向。'
+                    tools = [dict(tool, description='执行一条已支持的 drone.xxx() 调用；不支持任意程序或视觉问答')
+                             if tool.get('name') == 'run_program' else tool for tool in tools]
                 def _log(event):
                     name=event.get('event') if isinstance(event,dict) else event
                     if name in ('asr_text','reply_text','tool_result','error','audio_first',
                                 'playback_stats','tts_done','handshake_retry'):
-                        print('[豆包] '+json.dumps(event,ensure_ascii=False)[:300],flush=True)
+                        print('[豆包] '+json.dumps(event,ensure_ascii=False)[:5000],flush=True)
                 dialog=VolcDuplex(runner,audio,instructions=instructions,tools=tools,on_log=_log,
                                   on_user_text=lambda t: print('[STT] 识别文本：'+t,flush=True),
                                   on_reply_text=lambda t: print('[豆包] 回复：'+t,flush=True))

@@ -37,8 +37,8 @@ COMMAND_DEADLINE_S = {'takeoff': 25.0, 'land': 20.0}
 LAND_DISPATCH_TIMEOUT_S = 6.0
 KEEPALIVE_INTERVAL_S = 8.0
 LINK_FAULT_LIMIT = 3
-# 飞控刚上电时 Wi-Fi 已广播但飞控没就绪，`command` 会收到 0xcc 之类的半包，
-# djitellopy 把它当 UTF-8 解码错误抛出（现场复现 3 次）。等待 + 重试可消除。
+# command 曾收到无法按 UTF-8 解码的数据，来源尚未确认。
+# 重试复用同一 SDK 对象，避免旧对象析构删除新对象的 UDP 记录。
 CONNECT_ATTEMPTS = 3
 CONNECT_RETRY_DELAY_S = 2.0
 # 实测：标准 Tello 固件在电量 50% 就对本机 takeoff 直接回 error（不发电机）。
@@ -144,6 +144,10 @@ def _height_probe(tello=None):
         flying, cached = _flying, _height_cm
     if tello is None:
         return (cached, 'cached')
+    from .telemetry import read_height
+    packet_height = read_height(tello, flying)
+    if packet_height is not None:
+        return packet_height[0], packet_height[2]
     height = None
     try:
         height = tello.get_height()
@@ -199,10 +203,12 @@ def _plan_ascent(cm):
 
 
 def _plan_descent(cm):
-    height = _current_height()
-    if height <= 0: return cm
-    granted = min(cm, int(height))
-    return granted if granted >= 20 else cm
+    height, source = _height_probe()
+    if height is None or height < 40:
+        _record('height_limit_rejected', requested=cm, reason='descent_height_unknown_or_low', source=source)
+        return None
+    # Keep at least 20cm; landing is a separate explicit action.
+    return min(cm, int(height)-20)
 
 
 def _sanitise_rc(channels):
@@ -477,7 +483,7 @@ def health():
                     speed_cm_s=_speed_cm_s, velocity=_velocity,
                     video=_video is not None, battery=None, flight_time_s=None,
                     ceiling_cm=MAX_HEIGHT_CM, max_speed_cm_s=MAX_SPEED_CM_S,
-                    action_unknown=unknown)
+                    action_unknown=unknown, height_timestamp=None)
     if connected and tello is not None:
         for key, name in (('battery', 'get_battery'), ('flight_time_s', 'get_flight_time')):
             getter = getattr(tello, name, None)     # 驱动替身可能没有这些方法
@@ -488,6 +494,13 @@ def health():
                 continue
             if type(value) is int and value >= 0: data[key] = value
         data['height_cm'] = _current_height(tello)
+        from .telemetry import read_height
+        packet_height = read_height(tello, data['flying'])
+        if packet_height is not None:
+            height, stamp, source = packet_height
+            data.update(height_timestamp=stamp, height_source=source)
+            if height is not None:
+                data['height_cm'] = height
         if unknown:
             # 有“结果未知”的动作时，用这一轮真实遥测修正状态。
             reconcile_state(tello)
@@ -497,6 +510,8 @@ def health():
 
 def _tello_class(timeout):
     import djitellopy
+    from .telemetry import install_receiver_stamp
+    install_receiver_stamp(djitellopy.Tello)
 
     # djitellopy 的 send_control_command 被 @enforce_types 校验，timeout 必须是 int
     timeout = max(1, int(round(float(timeout))))
@@ -508,6 +523,17 @@ def _tello_class(timeout):
             # 基类 __init__ 的 host 默认值在定义时就绑死成 TELLO_IP，必须显式传
             super().__init__(**({} if host is None else {'host': host}))
             self.retry_count = 1
+            self._connection_ended = False
+        def connect(self, wait_for_state=True):
+            udp = self.get_own_udp_object()
+            udp['responses'].clear()
+            udp['state'] = {}
+            return super().connect(wait_for_state=wait_for_state)
+        def end(self):
+            if self._connection_ended:
+                return
+            self._connection_ended = True
+            return super().end()
         def send_control_command(self, command, timeout=timeout):
             return djitellopy.Tello.send_control_command(self, command, timeout=timeout)
 
@@ -525,8 +551,8 @@ def connect(address=None, *, timeout=RESPONSE_TIMEOUT_S):
     except Exception as exc:
         raise RuntimeError('djitellopy_unavailable: %s' % exc)
     tello, ready_error = None, ''
+    candidate = tello_class(str(address) if address else None)
     for attempt in range(1, CONNECT_ATTEMPTS + 1):
-        candidate = tello_class(str(address) if address else None)
         try:
             candidate.connect()
             tello = candidate
@@ -535,10 +561,10 @@ def connect(address=None, *, timeout=RESPONSE_TIMEOUT_S):
             ready_error = '%s: %s' % (type(exc).__name__, exc)
             _record('connect_retry', attempt=attempt, error=ready_error[:200],
                     max_attempts=CONNECT_ATTEMPTS)
-            try: candidate.end()
-            except Exception: pass
             if attempt < CONNECT_ATTEMPTS: time.sleep(CONNECT_RETRY_DELAY_S)
     if tello is None:
+        try: candidate.end()
+        except Exception: pass
         raise RuntimeError('tello_not_ready: %s' % ready_error)
     with _lock:
         _tello, SIMULATED = tello, False

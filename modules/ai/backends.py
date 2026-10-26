@@ -117,8 +117,13 @@ class SDKBackend:
 
     def emergency(self, land=False):
         """急停走底层 priority 通道：不进动作队列、不受 action_result_pending 阻塞。"""
-        call = self.sdk.land if land else self.sdk.stop_motion
-        result = self.normalize(call('model', priority=True))
-        s = self.sdk.get_status()
-        self.grant = {'control_epoch': s.control_epoch, 'command_epoch': s.command_epoch}
-        return result
+        if land:
+            # Landing retains its existing control/confirmation lifecycle.
+            result = self.normalize(self.sdk.land('model', priority=True))
+            s = self.sdk.get_status()
+            self.grant = {'control_epoch': s.control_epoch, 'command_epoch': s.command_epoch}
+            return result
+        # Share cancellation, follow teardown and atomic hover lease release
+        # with the local voice runner. Never adopt another action's fresh grant.
+        from drone_sdk.ai_bridge import UnifiedDrone
+        return UnifiedDrone().emergency(False)

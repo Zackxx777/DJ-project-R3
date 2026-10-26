@@ -98,7 +98,8 @@ def get_status():
         return StatusResult(h['battery'] if h else 88, h['height_cm'] if h else (0 if _flight_state == 'landed' else 120),
             bool(h['connected'] and h['link_ok']) if h else True,
             _flight_state, _current_owner or 'none', time.time(), _control_epoch,
-            _command_epoch, _driver.snapshot()['velocity'], _driver.SIMULATED)
+            _command_epoch, _driver.snapshot()['velocity'], _driver.SIMULATED,
+            h.get('height_timestamp') if h else None)
 
 def request_control(owner, *, priority=False):
     """priority=True 是紧急保留通道：不被在途动作/落地流程/占用者拦住，并作废在途动作。"""
@@ -226,18 +227,33 @@ def land(owner, *, control_epoch=None, command_epoch=None, priority=False):
             _driver.interrupt('land')
         return CommandResult(True, 'accepted', '', False)
 
-def stop_motion(owner, *, control_epoch=None, command_epoch=None, priority=False):
-    """priority=True：越过 action_result_pending / 代次校验，保证急停指令必达。"""
-    global _command_epoch, _active_action, _current_owner
+def stop_motion(owner, *, control_epoch=None, command_epoch=None, priority=False,
+                release_on_stop=False):
+    """Priority hover may end its lease atomically after the zero send succeeds.
+
+    Ordinary stop keeps its lease for the caller's normal action cleanup.
+    A priority interrupt uses release_on_stop so the next explicit follow or
+    model action can acquire a new lease without landing first.
+    """
+    global _command_epoch, _active_action, _current_owner, _control_epoch
     with _velocity_lock:
+        if release_on_stop and not priority:
+            return CommandResult(False, 'failed', 'priority_required', False)
         reason = '' if priority else _check(owner, control_epoch, command_epoch)
         if reason: return CommandResult(False, 'failed', reason, False)
         if priority:
             _driver.record_priority_override('stop_motion', current_owner=_current_owner)
+            if release_on_stop:
+                # Also revoke model's old lease: a cancelled action's finally
+                # block must never release a newer model/follow action's lease.
+                _control_epoch += 1
             if _current_owner != owner: _current_owner = owner
         _command_epoch += 1
         _active_action = None
         if _zero('stop_motion') is False: return CommandResult(False,'failed','stop_send_failed',False)
+        if release_on_stop:
+            _current_owner = None
+            _control_epoch += 1
         return CommandResult(True, 'accepted', '', False)
 
 def move_forward(owner, cm, **grant): return _mock_move(owner, 'forward', cm, **grant)
@@ -249,7 +265,8 @@ def move_down(owner, cm, **grant): return _mock_move(owner, 'down', cm, **grant)
 def rotate(owner, degrees, **grant): return _mock_move(owner, 'rotate', degrees, **grant)
 
 _follow = follow_integration.FollowIntegration(lambda: _current_owner or 'none')
-def start_follow(timeout=follow_integration.FIRST_FRAME_TIMEOUT): return _follow.start(timeout)
+def start_follow(timeout=follow_integration.FIRST_FRAME_TIMEOUT, *, cancelled=None):
+    return _follow.start(timeout, cancelled=cancelled)
 def stop_follow(): return _follow.stop()
 def is_following(): return _follow.is_following()
 def set_frame_provider(provider): _follow.set_frame_provider(provider)

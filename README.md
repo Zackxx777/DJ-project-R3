@@ -1,63 +1,65 @@
-# AI 随行小伙伴 · 三组开发仓库
+# AI 随行小伙伴 · 三组联调仓库
 
-基于二组整机代码，维护三组的识别、跟随控制和制动改动。统一使用 **Python 3.11**。
+基于二组交付的 `v4.1-bluetooth-ai-integrated`，整合标记跟随、豆包语音控制和动作交接。运行环境统一为 **Python 3.11**。
 
-当前基线是 [LenLanxi/DJ-project](https://github.com/LenLanxi/DJ-project) 的 `v4.1-bluetooth-ai-integrated`，提交 `9a7d2a17c4634b0c26bcab82a48410021031e714`。这是独立仓库：第一条提交保存上游源码快照，后续提交记录三组改动。原始历史、贡献者记录在上游仓库，来源见 [UPSTREAM.json](UPSTREAM.json)。
+**当前交付为 2026-10-27 联调版，已修改二组 SDK 和四组语音模块的部分代码。** 具体范围、接口约定和复测步骤见 [给二四组的交接说明](docs/HANDOFF_20261027.md)。请按整版比较合并，不要直接用旧版 `drone_sdk/` 或 `modules/ai/` 覆盖。
 
-## 包含的内容
+## 当前改进
 
-- 二组 SDK、四组 AI 模块和原有启动脚本一并保留；`drone_sdk/`、`modules/ai/` 的 66 个文件与上述上游版本逐字节一致。
-- 三组版本 `r3-9a7d2a1-braking1`：标记识别、开源 PID 适配、上下跟随、识别与发送线程、丢失归零、控制权交接和提前减速。
-- 三机分别绑定 `DICT_4X4_50` 的 ID 0、1、2，配置和标记图均在 `modules/follow/`。
-- 保留 v4.1 SDK 校验记录。开源 PID 原文件及许可证保留，Git 固定其换行格式，避免 Windows 检出后哈希失配。
+- 优化标记识别耗时、启动等待和短暂漏检恢复；显示检测状态、有效目标及停止原因。
+- 默认配置采用横移与转向结合的跟随，并启用带高度时效检查的上下跟随。
+- 调整追赶响应、提前减速和近距离前进限制；过期或丢失目标时归零。
+- 补齐语音六方向移动和旋转；跟随中平移/升降可暂停跟随、完成动作、按新画面更新基准，再按条件恢复。
+- 修复悬停后控制权未释放导致必须落地重飞才能跟随的问题。
+- 当前语音入口的左右以“用户面对机头”为约定；左右转默认 90°，仍支持指定角度。底层 SDK 与自动跟随坐标没有反转。
 
-这里只修改三组模块及本仓库说明。后续二组、四组更新需先比较再同步，不能用旧交付包直接覆盖。
+用户在 10 月 26 日完成了多轮实机测试，并反馈跟随已有改善。最新微调仍需按交接说明复测；未给出实测速度、制动距离或全场景验收结论。标记识别不等于豆包看图问答，后者的独立视觉模型尚未配置。
 
-## 验证进度与限制
+## 安装
 
-2026-10-26：Python 3.11.9 下 **612 项独立测试通过**，三个标记配置检查通过；实际 SDK、三组后台和四组 Gateway 的离线交接已运行。见 [验证记录](docs/R3_VALIDATION_20261026.md)。
-
-**这不是实飞验收。** 本次使用合成画面和模拟飞行，没有打开摄像头、麦克风或连接无人机。豆包实时语音、真实网络、制动距离、三机同时飞行仍需验证。
-
-已知限制：目标暂时丢失、跟随处于恢复等待时，四组普通运动请求可能收到 `control_busy: busy`。本次已记录，未修改二组、四组代码解决该行为。
-
-## 安装与离线检查
-
-在仓库根目录 PowerShell 中运行。原有 Python 3.14 可以保留。
+在 VS Code 中打开本仓库，在 PowerShell 终端执行：
 
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -X utf8 -B modules\follow\verify_r3_changes.py --output logs\r3_validation
-.\.venv\Scripts\python.exe -X utf8 -B modules\follow\check_follow_config.py --config modules\follow\configs\aircraft_A_ID0.json --config modules\follow\configs\aircraft_B_ID1.json --config modules\follow\configs\aircraft_C_ID2.json --expected-ids 0 1 2
-.\.venv\Scripts\python.exe -X utf8 -B modules\follow\check_team_handoff.py --root . --output logs\r3_handoff
+powershell -NoProfile -ExecutionPolicy Bypass -File .\start_r3_voice.ps1 -CheckOnly -RealDrone
 ```
 
-完整语音入口的额外依赖见 `requirements-stt.txt`；豆包需要单独取得有效密钥。`.env.example` 只是模板，真实密钥只放本机 `.env`，不要提交。原二组说明保存在 [README_UPSTREAM.md](README_UPSTREAM.md)，其中历史测试成绩和操作说明不代表本次已再次验证。
+`requirements.txt` 已补入音频重采样依赖 `soxr`，无需为豆包模式安装本地 Whisper 模型。VS Code 解释器选择 `.venv\Scripts\python.exe`。`-CheckOnly` 只检查依赖、跟随配置和启动参数，不连接云端、音频流或无人机。
 
-## 启用本次跟随配置
+## 启动豆包与跟随
 
-在启动整机程序的**同一个终端**里设置，例如飞机 A：
+先列出当前电脑的音频设备：
 
 ```powershell
-$env:R3_FOLLOW_CONFIG = (Resolve-Path .\modules\follow\configs\aircraft_A_ID0.json).Path
+powershell -NoProfile -ExecutionPolicy Bypass -File .\start_r3_voice.ps1 -ListDevices
 ```
 
-飞机 B、C 分别换成 `aircraft_B_ID1.json`、`aircraft_C_ID2.json`。没有设置时，整机入口可能回到旧配置，不能据此判断已启用本次 PID。应由整机入口调用 `controller.start_follow()`；直接创建控制器的旧演示不能替代后台服务验证。
+选择实际耳机的输入/输出编号。下面的 `1`、`5` **仅为示例，必须替换为自己电脑的编号**：
 
-| 飞机 | 标记 ID | 前后上限 | 转向上限 | 上下上限 |
-|---|---:|---:|---:|---:|
-| A | 0 | 40 RC | 50 RC | 20 RC |
-| B | 1 | 30 RC | 20 RC | 20 RC |
-| C | 2 | 30 RC | 20 RC | 20 RC |
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\start_r3_voice.ps1 -RealDrone -InputDevice 1 -OutputDevice 5
+```
 
-RC 是控制杆量，**不是厘米/秒**。当前按标记相对大小保持距离，尚无实测米数换算。默认 `yaw` 模式用转向对准目标，左右平移请求为零；`offline_candidates/` 中的混合和平移配置供对比，未完成实飞验证。上下跟随依赖新鲜、可信的高度数据，缺失时保持升降请求为零。
+按本机隐藏提示输入 `VOLC_API_KEY`；也支持继承进程已有的同名环境变量。密钥不写入仓库或命令参数。电脑通过 TELLO Wi-Fi 连接飞机，同时通过手机 USB 网络共享或有线网络访问豆包。只运行一个控制程序。
 
-## 后续维护
+- 此入口选择 `aircraft_A_ID0_motion_follow.json`（`DICT_4X4_50`，ID 0）。B/C 配置和旧 A 配置保留，但不等于已验证三机同时飞行。
+- `-RealDrone` 允许响应用户的起飞请求，不再要求额外的起飞解锁；启动程序不会自行起飞。起飞电量阈值为 30%。
+- 说“起飞”后尝试补高到接近 120 cm，再悬停；标记清晰可见后另说“跟着我”。可用 `-NoAutoClimb` 关闭补高。
+- 语音“向左转”“向右转”默认 90°；“向左转 45 度”保留指定角度。完成旋转后需要重新说“跟着我”。
+- `Ctrl+Shift+Alt+A` 请求零速度悬停，`Ctrl+Shift+Alt+L` 请求降落；悬停不是停桨。先落地再退出终端。
+- 不加 `-RealDrone` 时仅测试云端语音与模拟飞机。
 
-1. 新修改放在 `modules/follow/`，通过离线检查后再提交。
-2. `origin` 指向本仓库；本机 `upstream` 仅用于读取二组更新，推送已禁用。
-3. 同步上游时检查差异及 SDK 校验记录，重跑三组测试与交接检查。
-4. 不提交虚拟环境、密钥、现场录像、录音及运行日志；旧压缩包继续保留。
+当前现场验证使用 **无 Docker 时的本地白名单执行器**。安装了 Docker 时原入口会选择另一条沙箱执行路径；不能把这次实测结果直接当作沙箱路径的验收。详见交接说明。
 
-许可证与来源沿用相应原文件；开源依赖来源和哈希见 [PROVENANCE.json](modules/follow/r3_follow/_vendor/PROVENANCE.json)，未为整机项目另行声明新许可证。
+## 发布前离线验证
+
+2026-10-27，Python 3.11.9：跟随测试 **656 项**、语音测试 **106 项**、跨模块专项 **122 项**，均通过。这是各测试命令收集到的执行数，包含继承/集成覆盖，不能视作 884 个互不重复场景；本轮验证没有实飞。
+
+复现命令、专项文件与尚需实测的内容见 [交接说明](docs/HANDOFF_20261027.md)。旧的 [10 月 26 日验证记录](docs/R3_VALIDATION_20261026.md) 是早期版本记录，不代表当前源码仍与二四组原版一致。
+
+## 来源与旧版保留
+
+上游：[LenLanxi/DJ-project](https://github.com/LenLanxi/DJ-project)，提交 `9a7d2a17c4634b0c26bcab82a48410021031e714`。本仓库初始提交 `727f2af` 保存原版源码快照，`aeb9787` 保存早期三组制动集成版；此前发出的本地压缩包未覆盖。来源见 [UPSTREAM.json](UPSTREAM.json)，原 README 见 [README_UPSTREAM.md](README_UPSTREAM.md)。
+
+开源 PID 原文件及许可证保留在 `modules/follow/r3_follow/_vendor/`。密钥、虚拟环境、本机音频配置及原始实飞/录音日志不随公开仓库上传。

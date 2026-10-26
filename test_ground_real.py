@@ -77,7 +77,13 @@ def self_check():
     driver._height_cm = 240
     check('距限高只剩 10cm 时拒绝继续上升', driver._plan_ascent(50) is None)
     driver._height_cm = 0
-    check('地面附近下降指令不被夹紧', driver._plan_descent(50) == 50)
+    check('地面附近拒绝下降', driver._plan_descent(50) is None)
+    driver._height_cm = 35
+    check('高度不足 40cm 时拒绝下降', driver._plan_descent(20) is None)
+    driver._height_cm = 60
+    check('下降保留 20cm 高度余量', driver._plan_descent(50) == 40)
+    driver._height_cm = 120
+    check('高度充足时保留请求距离', driver._plan_descent(20) == 20)
 
     driver._flying, driver._height_cm = False, 0
     check('未起飞时 RC 通道被压成全 0', driver._sanitise_rc((40, 40, 40, 0)) == (0, 0, 0, 0))
