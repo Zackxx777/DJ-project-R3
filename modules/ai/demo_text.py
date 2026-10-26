@@ -1,0 +1,114 @@
+"""固定指令的本地演示；不是AI，不执行生成代码，不支持实机。"""
+import json
+from drone_adapter import MockDrone
+
+HELP = '可输入：查看电量、查看状态、起飞、跟着我、前进30厘米、停止跟随、停在这里、降落、退出'
+
+
+class Demo:
+    def __init__(self, drone=None):
+        self.drone = drone or MockDrone()
+
+    def describe(self):
+        """状态口语化：TTS 要念人话，不能把 status 字典原样念出去。"""
+        status = self.drone.get_status()
+        parts = ['当前电量 %s%%' % status.get('battery')]
+        height = status.get('height_cm')
+        if type(height) is int:
+            parts.append('高度 %d 厘米' % height)
+        parts.append('正在飞行' if status.get('flying') else '未起飞，在地面')
+        if status.get('following'):
+            parts.append('跟随已开启')
+        parts.append('链路正常' if status.get('connected', True) else '链路异常')
+        return '，'.join(parts) + '。'
+
+    def handle(self, text):
+        text = text.strip()
+        drone = self.drone
+        prefix = '[模拟] ' if drone.get_status().get('simulated', True) else '[真机] '
+        if text == '查看电量':
+            return prefix + '当前电量为%d%%。' % drone.get_status()['battery']
+        if text == '查看状态':
+            return prefix + self.describe()
+        if text == '跟着我':
+            result = drone.start_follow()
+            if result['ok']:
+                return prefix + '已开始跟随'
+            # 带上真实原因（地面状态通常是"尚未起飞"），别只说"请查看状态"
+            return prefix + '无法开始跟随：' + str(result.get('message') or '原因未知')
+        if text == '停止跟随':
+            return prefix + drone.stop_follow()['message']
+        import re
+        move=re.fullmatch(r'前进(\d+)厘米',text)
+        if move and 20<=int(move.group(1))<=100:
+            distance=int(move.group(1))
+            text='前进30厘米'
+        else: distance=30
+        actions = {
+            '起飞': lambda: drone.takeoff('model'),
+            '降落': lambda: drone.land('model'),
+            '停在这里': lambda: drone.stop_motion('model'),
+            '前进30厘米': lambda: drone.move_forward('model', distance),
+        }
+        if text not in actions:
+            # 未知/听写错误的指令：绝不执行动作，并且必须让 TTS 能播报这句反问。
+            # 这里只给一句短的——help 列表在启动横幅里已经打过了，念出来太啰嗦。
+            return '抱歉，我没听清，请再说一遍；未识别固定指令，没有执行动作。'
+        was_following = drone.is_following()
+        owns_follow = drone.get_status().get('owner') == 'follow'
+        ticket = None
+        ticket_handoff = hasattr(drone, 'pause_follow_for_action')
+        if text in ('降落', '停在这里'):
+            # Also invalidate a paused action's ticket when following=False.
+            result = drone.stop_follow()
+            if not result['ok']:
+                return prefix + '停止跟随未确认，未继续执行动作'
+        if was_following or owns_follow:
+            result = (drone.pause_follow_for_action() if ticket_handoff and
+                      text == '前进30厘米' else drone.stop_follow())
+            ticket = result.get('ticket')
+            if not result['ok']:
+                return prefix + '无法暂停跟随，取消动作'
+        result = drone.request_control('model')
+        if not result['ok']:
+            if ticket is not None:
+                drone.finish_follow_action(ticket, 'failed')
+            return prefix + result['message'] + '；未执行动作'
+        result = None
+        try:
+            result = actions[text]()
+            message = result['message']
+            if not result['ok']:
+                stopped = drone.stop_motion('model')
+                message += '；' + stopped['message'] + '；不恢复跟随'
+        except Exception as exc:
+            result = {'ok': False}
+            stopped = drone.stop_motion('model')
+            message = '模拟执行异常：' + str(exc) + '；' + stopped['message'] + '；不恢复跟随'
+        finally:
+            released = drone.release_control('model')
+        if result['ok'] and was_following and text == '前进30厘米':
+            if not released['ok'] or (ticket_handoff and result.get('status') != 'completed'):
+                if ticket is not None:
+                    drone.finish_follow_action(ticket, 'failed')
+                return prefix + message + '；动作完成或控制权释放未确认，不恢复跟随'
+            resumed = (drone.finish_follow_action(ticket, 'completed') if ticket_handoff
+                       else drone.start_follow())
+            message += '；' + ('已恢复模拟跟随' if resumed['ok'] else '未恢复跟随：' + resumed['message'])
+        elif ticket is not None:
+            drone.finish_follow_action(ticket, 'failed')
+        return prefix + message
+
+if __name__ == '__main__':
+    print('AI随行小伙伴 · 接口流程演示 v0.1')
+    print('固定文字指令，无大模型、无语音、无真实无人机连接。')
+    print(HELP)
+    demo = Demo()
+    while True:
+        try:
+            text = input('你：')
+        except (EOFError, KeyboardInterrupt):
+            break
+        if text.strip() == '退出':
+            break
+        print('程序：' + demo.handle(text))
